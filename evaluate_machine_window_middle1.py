@@ -7,7 +7,7 @@ import os
 
 from main_model import CSDI_Physio
 from dataset import get_dataloader
-from utils import train,  window_trick_evaluate_middle, reconstruction_window_trick_evaluate_middle
+from utils import train,  window_trick_evaluate_middle, reconstruction_window_trick_evaluate_middle, reconstruction_validation_threshold
 
 parser = argparse.ArgumentParser(description="CSDI")
 parser.add_argument("--config", type=str, default="base.yaml")
@@ -26,6 +26,8 @@ parser.add_argument("--diffusion_step",type=int,default=50)
 parser.add_argument("--machine_number",type=int,default=1)
 parser.add_argument("--file",type=str)
 parser.add_argument('--dataset',type=str,default="SMD")
+parser.add_argument("--validation_threshold_root", type=str, default="validation_threshold")
+parser.add_argument("--validation_threshold_ratio", type=float, default=0.02)
 args = parser.parse_args()
 
 
@@ -135,6 +137,8 @@ for iteration in os.listdir("train_result"):
         os.makedirs(f"window_result/{iteration}/{diffusion_step}", exist_ok=True)#改过代码
         target_folder = f"window_result/{iteration}/{diffusion_step}/{subset_name}"
         os.makedirs(target_folder, exist_ok=True)
+        validation_threshold_folder = f"{args.validation_threshold_root}/{iteration}/{diffusion_step}/{subset_name}"
+        os.makedirs(validation_threshold_folder, exist_ok=True)
 
         for temp_i in range(0,1):
             if task_mode == "reconstruction":
@@ -147,6 +151,25 @@ for iteration in os.listdir("train_result"):
                     foldername=target_folder,
                     epoch_number=0,
                     name=str(temp_i),
+                    split=split,
+                )
+                compute_abs = True
+                compute_sum = True
+                if args.dataset == "PSM":
+                    compute_sum = False
+                if args.dataset == "SMD" or args.dataset == "GCP":
+                    compute_sum = False
+
+                # RECON_CHANGE: validation residual chooses threshold without saving a second reconstruction pkl.
+                reconstruction_validation_threshold(
+                    model,
+                    valid_loader,
+                    topk_ratio=args.validation_threshold_ratio,
+                    compute_abs=compute_abs,
+                    compute_sum=compute_sum,
+                    nsample=1,
+                    foldername=validation_threshold_folder,
+                    filename=f"{0}-generated_outputs_nsample1{str(temp_i)}_stop_number_-1_threshold.json",
                     split=split,
                 )
             else:

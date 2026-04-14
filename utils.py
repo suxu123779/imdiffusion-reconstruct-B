@@ -3,6 +3,8 @@ import torch
 from torch.optim import Adam
 from tqdm import tqdm
 import pickle
+import json
+import os
 
 
 def train(
@@ -54,8 +56,8 @@ def train(
                     },
                     refresh=False,
                 )
-                if batch_no == 1:
-                    break
+                #if batch_no == 1:
+                    #break
             lr_scheduler.step()
 
         # if valid_loader is not None and (epoch_no + 1) % valid_epoch_interval == 0:
@@ -770,6 +772,87 @@ def reconstruction_window_trick_evaluate_middle(model, test_loader, nsample=20, 
                     ],
                     f,
                 )
+
+
+def compute_reconstruction_residual(prediction, target, compute_abs=True, compute_sum=True):
+    if compute_sum and compute_abs:
+        residual = torch.sum(torch.abs(prediction - target), dim=-1)
+    elif compute_sum and not compute_abs:
+        residual = torch.sum((prediction - target) ** 2, dim=-1)
+    elif not compute_sum and compute_abs:
+        residual, _ = torch.max(torch.abs(prediction - target), dim=-1)
+    elif not compute_sum and not compute_abs:
+        residual, _ = torch.max((prediction - target) ** 2, dim=-1)
+    return residual
+
+
+def reconstruction_validation_threshold(model, valid_loader, topk_ratio=0.02, compute_abs=True, compute_sum=True, nsample=1, foldername="", filename="threshold.json", stop_number=-1, split=4):
+    with torch.no_grad():
+        model.eval()
+        all_residual = []
+        head_residual = None
+        final_step_index = 0
+
+        with tqdm(valid_loader, mininterval=5.0, maxinterval=50.0) as it:
+            for batch_no, valid_batch in enumerate(it, start=1):
+                if batch_no == stop_number:
+                    break
+
+                output = model.get_middle_evaluate(valid_batch, nsample)
+                _samples, c_target, _eval_points, _observed_points, _observed_time, middle_result = output
+
+                middle_result = middle_result.permute(0, 1, 3, 2)
+                c_target = c_target.permute(0, 2, 1)
+
+                L = middle_result.shape[2]
+                if batch_no == 1:
+                    head_final_reconstruction = middle_result[0, final_step_index, 0: L // split, :]
+                    head_target = c_target[0, 0: L // split, :]
+                    head_residual = compute_reconstruction_residual(
+                        head_final_reconstruction,
+                        head_target,
+                        compute_abs=compute_abs,
+                        compute_sum=compute_sum,
+                    ).reshape(-1).detach().cpu()
+
+                final_reconstruction = middle_result[:, final_step_index, L // split: L - L // split, :]
+                c_target = c_target[:, L // split: L - L // split, :]
+                residual = compute_reconstruction_residual(
+                    final_reconstruction,
+                    c_target,
+                    compute_abs=compute_abs,
+                    compute_sum=compute_sum,
+                )
+                all_residual.append(residual.reshape(-1).detach().cpu())
+
+        if head_residual is not None:
+            all_residual.insert(0, head_residual)
+        if len(all_residual) == 0:
+            raise ValueError("empty validation residual while computing reconstruction threshold")
+
+        validation_residual = torch.cat(all_residual, dim=0)
+        anomaly_number = max(int(topk_ratio * len(validation_residual)), 1)
+        anomaly_number = min(anomaly_number, len(validation_residual))
+        threshold = validation_residual.reshape(-1).topk(anomaly_number).values[-1].item()
+
+        threshold_info = {
+            "threshold": threshold,
+            "topk_ratio": topk_ratio,
+            "final_step_index": final_step_index,
+            "validation_topk_count": anomaly_number,
+            "validation_residual_count": len(validation_residual),
+            "mean_validation_last_step_score": torch.mean(validation_residual).item(),
+            "compute_abs": compute_abs,
+            "compute_sum": compute_sum,
+        }
+
+        os.makedirs(foldername, exist_ok=True)
+        with open(os.path.join(foldername, filename), "w") as f:
+            json.dump(threshold_info, f, indent=4)
+
+        print(f"validation threshold saved to {os.path.join(foldername, filename)}")
+        print(f"validation threshold info is {threshold_info}")
+        return threshold_info
 
 
 def ddim_evaluate(model, test_loader1, test_loader2, nsample=20, scaler=1, mean_scaler=0, foldername="",epoch_number = "",name="",ddim_eta=0,ddim_steps=10):
