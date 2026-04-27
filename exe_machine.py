@@ -72,7 +72,7 @@ except:
     pass
 
 
-for training_epoch in range(0,6):
+for training_epoch in range(0,3):
     print(f"begin to train for training_epoch {training_epoch} ...")
     try:
         os.mkdir(f"train_result/save{training_epoch}")
