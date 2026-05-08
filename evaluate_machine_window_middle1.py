@@ -7,7 +7,13 @@ import os
 
 from main_model import CSDI_Physio
 from dataset import get_dataloader
-from utils import train,  window_trick_evaluate_middle, reconstruction_window_trick_evaluate_middle, reconstruction_validation_threshold
+from utils import (
+    train,
+    window_trick_evaluate_middle,
+    reconstruction_window_trick_evaluate_middle,
+    reconstruction_validation_threshold,
+    ensure_outputs_can_be_written,
+)
 
 parser = argparse.ArgumentParser(description="CSDI")
 parser.add_argument("--config", type=str, default="base.yaml")
@@ -28,7 +34,12 @@ parser.add_argument("--file",type=str)
 parser.add_argument('--dataset',type=str,default="SMD")
 parser.add_argument("--validation_threshold_root", type=str, default="validation_threshold")
 parser.add_argument("--validation_threshold_ratio", type=float, default=0.02)
+parser.add_argument("--pathB_output_root", type=str, default="pathB_result")
+parser.add_argument("--result_tag", type=str, default="")
+parser.add_argument("--overwrite", action="store_true")
+parser.add_argument("--pathB_mid_step", type=int, default=None)
 args = parser.parse_args()
+result_tag = args.result_tag or args.dataset
 
 
 path = "config/" + args.config
@@ -60,6 +71,8 @@ for iteration in os.listdir("train_result"):
     for subset_name in os.listdir(f"train_result/{iteration}/"):
 
         data_id = subset_name.split("_unconditional")[0]
+        if data_id != args.dataset:
+            continue
 
         if "unconditional:True" in subset_name:
             unconditional = True
@@ -115,12 +128,16 @@ for iteration in os.listdir("train_result"):
             feature_dim = 25
         elif args.dataset == "MSL":
             feature_dim = 55
-        elif args.dataset == "SMAP":
+        elif args.dataset == "SMAP" or args.dataset.startswith("SMAP_MVE"):
             feature_dim = 25
         elif args.dataset == "GCP":
             feature_dim = 19
         elif args.dataset == "SWaT":
             feature_dim = 45
+        elif args.dataset == "CODERED":
+            feature_dim = 48
+        else:
+            raise ValueError(f"Unknown dataset {args.dataset}")
 
         model = CSDI_Physio(run_config, args.device, target_dim=feature_dim, ratio=args.ratio).to(args.device)
 
@@ -142,6 +159,14 @@ for iteration in os.listdir("train_result"):
 
         for temp_i in range(0,1):
             if task_mode == "reconstruction":
+                threshold_filename = f"{0}-generated_outputs_nsample1{str(temp_i)}_stop_number_-1_threshold.json"
+                ensure_outputs_can_be_written(
+                    [
+                        f"{target_folder}/{0}-generated_outputs_nsample1{str(temp_i)}_stop_number_-1.pk",
+                        os.path.join(validation_threshold_folder, threshold_filename),
+                    ],
+                    overwrite=args.overwrite,
+                )
                 # RECON_CHANGE: reconstruction 推理忽略第二个 strategy loader，仅使用单个 loader 输出完整重构结果。
                 reconstruction_window_trick_evaluate_middle(
                     model,
@@ -152,6 +177,11 @@ for iteration in os.listdir("train_result"):
                     epoch_number=0,
                     name=str(temp_i),
                     split=split,
+                    pathB_output_root=args.pathB_output_root,
+                    result_tag=result_tag,
+                    run_id=iteration,
+                    overwrite=args.overwrite,
+                    pathB_mid_step=args.pathB_mid_step,
                 )
                 compute_abs = True
                 compute_sum = True
@@ -169,7 +199,7 @@ for iteration in os.listdir("train_result"):
                     compute_sum=compute_sum,
                     nsample=1,
                     foldername=validation_threshold_folder,
-                    filename=f"{0}-generated_outputs_nsample1{str(temp_i)}_stop_number_-1_threshold.json",
+                    filename=threshold_filename,
                     split=split,
                 )
             else:

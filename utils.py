@@ -7,6 +7,16 @@ import json
 import os
 
 
+def ensure_outputs_can_be_written(paths, overwrite=False):
+    existing_paths = [path for path in paths if path and os.path.exists(path)]
+    if existing_paths and not overwrite:
+        existing_text = "\n".join(existing_paths)
+        raise FileExistsError(
+            "output already exists. Pass --overwrite to replace:\n"
+            f"{existing_text}"
+        )
+
+
 def train(
     model,
     config,
@@ -673,7 +683,23 @@ def window_trick_evaluate_middle(model, test_loader1, test_loader2, nsample=20, 
 
 
 
-def reconstruction_window_trick_evaluate_middle(model, test_loader, nsample=20, scaler=1, mean_scaler=0, foldername="",epoch_number = "",name="",stop_number=-1,split=4):
+def reconstruction_window_trick_evaluate_middle(
+        model,
+        test_loader,
+        nsample=20,
+        scaler=1,
+        mean_scaler=0,
+        foldername="",
+        epoch_number="",
+        name="",
+        stop_number=-1,
+        split=4,
+        pathB_output_root=None,
+        result_tag=None,
+        run_id="",
+        overwrite=False,
+        pathB_mid_step=None,
+):
 
     with torch.no_grad():
         model.eval()
@@ -687,6 +713,32 @@ def reconstruction_window_trick_evaluate_middle(model, test_loader, nsample=20, 
         all_evalpoint = []
         all_generated_samples = []
         all_middle = []
+        all_final_recon_score = []
+        all_pathB_feature_score = []
+        pathB_enabled = pathB_output_root is not None and result_tag is not None
+        pathB_metadata = {}
+        safe_run_id = str(run_id) if str(run_id) else "run"
+
+        if pathB_enabled:
+            inference_folder = os.path.join(pathB_output_root, result_tag, "inference")
+            ensemble_folder = os.path.join(pathB_output_root, result_tag, "ensemble")
+            pathB_inference_path = os.path.join(inference_folder, f"window_scores_{safe_run_id}.pt")
+            pathB_inference_meta_path = os.path.join(inference_folder, f"metadata_{safe_run_id}.json")
+            final_recon_score_path = os.path.join(ensemble_folder, f"final_recon_score_ensemble_{safe_run_id}.pt")
+            pathB_feature_score_path = os.path.join(ensemble_folder, f"pathB_feature_score_ensemble_{safe_run_id}.pt")
+            pathB_ensemble_meta_path = os.path.join(ensemble_folder, f"metadata_{safe_run_id}.json")
+            ensure_outputs_can_be_written(
+                [
+                    pathB_inference_path,
+                    pathB_inference_meta_path,
+                    final_recon_score_path,
+                    pathB_feature_score_path,
+                    pathB_ensemble_meta_path,
+                ],
+                overwrite=overwrite,
+            )
+            os.makedirs(inference_folder, exist_ok=True)
+            os.makedirs(ensemble_folder, exist_ok=True)
 
         with tqdm(test_loader, mininterval=5.0, maxinterval=50.0) as it:
             for batch_no, test_batch in enumerate(it, start=1):
@@ -694,8 +746,19 @@ def reconstruction_window_trick_evaluate_middle(model, test_loader, nsample=20, 
                     break
 
                 # RECON_CHANGE: reconstruction 推理直接输出完整窗口重构，不再依赖双 loader 的插补拼接逻辑。
-                output = model.get_middle_evaluate(test_batch, nsample)
-                samples, c_target, eval_points, observed_points, observed_time, middle_result = output
+                output = model.get_middle_evaluate(
+                    test_batch,
+                    nsample,
+                    return_pathB=pathB_enabled,
+                    pathB_mid_step=pathB_mid_step,
+                )
+                if pathB_enabled:
+                    samples, c_target, eval_points, observed_points, observed_time, middle_result, batch_pathB = output
+                    final_recon_score = batch_pathB["final_recon_score"]
+                    pathB_feature_score = batch_pathB["pathB_feature_score"]
+                    pathB_metadata["pathB_mid_step"] = batch_pathB["pathB_mid_step"]
+                else:
+                    samples, c_target, eval_points, observed_points, observed_time, middle_result = output
 
                 middle_result = middle_result.permute(0, 1, 3, 2)
                 samples = samples.permute(0, 1, 3, 2)  # (B, nsample, L, K)
@@ -709,11 +772,17 @@ def reconstruction_window_trick_evaluate_middle(model, test_loader, nsample=20, 
                     head_c_target = c_target[0, 0: L // split, :]
                     head_observed_points = observed_points[0, 0: L // split, :]
                     head_middle = middle_result[0, :, 0: L // split, :]
+                    if pathB_enabled:
+                        head_final_recon_score = final_recon_score[0, 0: L // split]
+                        head_pathB_feature_score = pathB_feature_score[0, 0: L // split]
 
                 samples = samples[:, :, L // split: L - L // split, :]
                 c_target = c_target[:, L // split: L - L // split, :]
                 observed_points = observed_points[:, L // split: L - L // split, :]
                 middle_result = middle_result[:, :, L // split: L - L // split, :]
+                if pathB_enabled:
+                    final_recon_score = final_recon_score[:, L // split: L - L // split]
+                    pathB_feature_score = pathB_feature_score[:, L // split: L - L // split]
 
                 samples_median = samples.median(dim=1).values
                 eval_points = torch.ones_like(samples_median)
@@ -724,6 +793,9 @@ def reconstruction_window_trick_evaluate_middle(model, test_loader, nsample=20, 
                 all_observed_point.append(observed_points)
                 all_observed_time.append(observed_time)
                 all_middle.append(middle_result)
+                if pathB_enabled:
+                    all_final_recon_score.append(final_recon_score.detach().cpu())
+                    all_pathB_feature_score.append(pathB_feature_score.detach().cpu())
 
                 mse_current = ((samples_median - c_target) ** 2) * (scaler ** 2)
                 mae_current = torch.abs(samples_median - c_target) * scaler
@@ -772,6 +844,51 @@ def reconstruction_window_trick_evaluate_middle(model, test_loader, nsample=20, 
                     ],
                     f,
                 )
+
+            if pathB_enabled:
+                final_recon_score_windows = torch.cat(all_final_recon_score, dim=0).to("cpu")
+                pathB_feature_score_windows = torch.cat(all_pathB_feature_score, dim=0).to("cpu")
+                head_final_recon_score = head_final_recon_score.to("cpu")
+                head_pathB_feature_score = head_pathB_feature_score.to("cpu")
+
+                final_recon_score_ensemble = torch.cat(
+                    [head_final_recon_score.reshape(-1), final_recon_score_windows.reshape(-1)],
+                    dim=0,
+                )
+                pathB_feature_score_ensemble = torch.cat(
+                    [head_pathB_feature_score.reshape(-1), pathB_feature_score_windows.reshape(-1)],
+                    dim=0,
+                )
+
+                common_metadata = {
+                    "result_tag": result_tag,
+                    "run_id": safe_run_id,
+                    "pathB_mid_step": pathB_metadata.get("pathB_mid_step"),
+                    "nsample": nsample,
+                    "split": split,
+                    "score_shape": {
+                        "final_recon_score_ensemble": list(final_recon_score_ensemble.shape),
+                        "pathB_feature_score_ensemble": list(pathB_feature_score_ensemble.shape),
+                    },
+                }
+
+                torch.save(
+                    {
+                        "final_recon_score_windows": final_recon_score_windows,
+                        "pathB_feature_score_windows": pathB_feature_score_windows,
+                        "head_final_recon_score": head_final_recon_score,
+                        "head_pathB_feature_score": head_pathB_feature_score,
+                        **common_metadata,
+                    },
+                    pathB_inference_path,
+                )
+                torch.save(final_recon_score_ensemble, final_recon_score_path)
+                torch.save(pathB_feature_score_ensemble, pathB_feature_score_path)
+
+                with open(pathB_inference_meta_path, "w") as f:
+                    json.dump(common_metadata, f, indent=4)
+                with open(pathB_ensemble_meta_path, "w") as f:
+                    json.dump(common_metadata, f, indent=4)
 
 
 def compute_reconstruction_residual(prediction, target, compute_abs=True, compute_sum=True):

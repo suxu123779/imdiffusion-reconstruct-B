@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from diff_models import diff_CSDI
 from tqdm import tqdm
 import random
@@ -188,11 +189,32 @@ class CSDI_base(nn.Module):
 
         return reconstructed_samples
 
-    def get_middle_reconstruct_value(self, observed_data, cond_mask, side_info, n_samples, strategy_type):
+    def compute_pathB_feature_score(self, h_mid, h_final):
+        B, C, K, L = h_mid.shape
+        h_mid = h_mid.permute(0, 3, 1, 2).reshape(B, L, C * K)
+        h_final = h_final.permute(0, 3, 1, 2).reshape(B, L, C * K)
+        return 1.0 - F.cosine_similarity(h_mid, h_final, dim=-1, eps=1e-8)
+
+    def get_middle_reconstruct_value(
+        self,
+        observed_data,
+        cond_mask,
+        side_info,
+        n_samples,
+        strategy_type,
+        return_pathB=False,
+        pathB_mid_step=None,
+    ):
         B, K, L = observed_data.shape
         reconstructed_samples = torch.zeros(B, n_samples, K, L).to(self.device)
         reconstructed_middle_samples = torch.zeros(B, self.num_steps, K, L).to(self.device)
         last_step = self.num_steps - 1
+        if pathB_mid_step is None:
+            pathB_mid_step = self.num_steps // 2
+        pathB_mid_step = max(0, min(int(pathB_mid_step), last_step))
+        h_mid = None
+        h_final = None
+        final_recon_score = None
 
         for i in range(n_samples):
             # RECON_CHANGE: 为了兼容现有 .pk 结构，保留每个 diffusion step 的整段 reconstruction 中间结果。
@@ -202,12 +224,26 @@ class CSDI_base(nn.Module):
 
             for t in range(last_step, -1, -1):
                 diff_input = self.set_input_to_diffmodel(current_sample, observed_data, cond_mask)
-                predicted = self.diffmodel(
-                    diff_input,
-                    side_info,
-                    torch.tensor([t]).to(self.device),
-                    strategy_type,
-                )
+                capture_hidden = return_pathB and (t == pathB_mid_step or t == 0)
+                if capture_hidden:
+                    predicted, hidden = self.diffmodel(
+                        diff_input,
+                        side_info,
+                        torch.tensor([t]).to(self.device),
+                        strategy_type,
+                        return_hidden=True,
+                    )
+                    if t == pathB_mid_step:
+                        h_mid = hidden.detach()
+                    if t == 0:
+                        h_final = hidden.detach()
+                else:
+                    predicted = self.diffmodel(
+                        diff_input,
+                        side_info,
+                        torch.tensor([t]).to(self.device),
+                        strategy_type,
+                    )
 
                 step_alpha = self.alpha_torch[t]
                 reconstructed = (current_sample - (1.0 - step_alpha) ** 0.5 * predicted) / (step_alpha ** 0.5)
@@ -218,7 +254,18 @@ class CSDI_base(nn.Module):
                     current_sample = (previous_alpha ** 0.5) * reconstructed + (1.0 - previous_alpha) ** 0.5 * predicted
 
             reconstructed_samples[:, i] = reconstructed.detach()
+            if return_pathB:
+                final_recon_score = torch.sum(torch.abs(reconstructed.detach() - observed_data), dim=1)
 
+        if return_pathB:
+            if h_mid is None or h_final is None:
+                raise RuntimeError("pathB hidden features were not captured during reconstruction")
+            pathB_result = {
+                "pathB_mid_step": pathB_mid_step,
+                "final_recon_score": final_recon_score.detach(),
+                "pathB_feature_score": self.compute_pathB_feature_score(h_mid, h_final).detach(),
+            }
+            return reconstructed_samples, reconstructed_middle_samples, pathB_result
         return reconstructed_samples, reconstructed_middle_samples
 
     def impute(self, observed_data, cond_mask, side_info, n_samples,strategy_type):
@@ -447,7 +494,7 @@ class CSDI_base(nn.Module):
         # 此处target_mask给的是那些待预测的点
         return samples, observed_data, target_mask, observed_mask, observed_tp
 
-    def get_middle_evaluate(self, batch, n_samples):
+    def get_middle_evaluate(self, batch, n_samples, return_pathB=False, pathB_mid_step=None):
         (
             observed_data,
             observed_mask,
@@ -465,12 +512,25 @@ class CSDI_base(nn.Module):
                 strategy_type = torch.zeros_like(strategy_type)
                 eval_points = observed_mask.clone()
                 side_info = self.get_side_info(observed_tp, cond_mask)
-                samples, reconstructed_middle_samples = self.get_middle_reconstruct_value(
-                    observed_data, cond_mask, side_info, n_samples, strategy_type
-                )
+                if return_pathB:
+                    samples, reconstructed_middle_samples, pathB_result = self.get_middle_reconstruct_value(
+                        observed_data,
+                        cond_mask,
+                        side_info,
+                        n_samples,
+                        strategy_type,
+                        return_pathB=True,
+                        pathB_mid_step=pathB_mid_step,
+                    )
+                else:
+                    samples, reconstructed_middle_samples = self.get_middle_reconstruct_value(
+                        observed_data, cond_mask, side_info, n_samples, strategy_type
+                    )
 
                 for i in range(len(cut_length)):  # to avoid double evaluation
                     eval_points[i, ..., 0 : cut_length[i].item()] = 0
+                if return_pathB:
+                    return samples, observed_data, eval_points, observed_mask, observed_tp, reconstructed_middle_samples, pathB_result
                 return samples, observed_data, eval_points, observed_mask, observed_tp, reconstructed_middle_samples
 
             cond_mask = gt_mask
