@@ -2,13 +2,97 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import copy
 
 
 def get_torch_trans(heads=8, layers=1, channels=64):
-    encoder_layer = nn.TransformerEncoderLayer(
+    encoder_layer = TransformerEncoderLayerWithAttn(
         d_model=channels, nhead=heads, dim_feedforward=64, activation="gelu"
     )
-    return nn.TransformerEncoder(encoder_layer, num_layers=layers)
+    return TransformerEncoderWithAttn(encoder_layer, num_layers=layers)
+
+
+def _get_activation_fn(activation):
+    if activation == "relu":
+        return F.relu
+    if activation == "gelu":
+        return F.gelu
+    raise RuntimeError(f"unsupported activation: {activation}")
+
+
+class TransformerEncoderLayerWithAttn(nn.Module):
+    """TransformerEncoderLayer-compatible block that can optionally return attention.
+
+    The submodule names intentionally match torch.nn.TransformerEncoderLayer so
+    existing checkpoints keep the same state_dict keys.
+    """
+
+    def __init__(
+        self,
+        d_model,
+        nhead,
+        dim_feedforward=2048,
+        dropout=0.1,
+        activation="relu",
+        layer_norm_eps=1e-5,
+    ):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.norm1 = nn.LayerNorm(d_model, eps=layer_norm_eps)
+        self.norm2 = nn.LayerNorm(d_model, eps=layer_norm_eps)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.activation = _get_activation_fn(activation)
+
+    def forward(self, src, return_attn=False):
+        if return_attn:
+            try:
+                src2, attn = self.self_attn(
+                    src,
+                    src,
+                    src,
+                    need_weights=True,
+                    average_attn_weights=False,
+                )
+            except TypeError:
+                src2, attn = self.self_attn(src, src, src, need_weights=True)
+                if attn.dim() == 3:
+                    attn = attn.unsqueeze(1)
+        else:
+            src2 = self.self_attn(src, src, src, need_weights=False)[0]
+            attn = None
+        src = src + self.dropout1(src2)
+        src = self.norm1(src)
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        src = src + self.dropout2(src2)
+        src = self.norm2(src)
+        if return_attn:
+            return src, attn
+        return src
+
+
+class TransformerEncoderWithAttn(nn.Module):
+    """Small nn.TransformerEncoder-compatible wrapper with optional attn return."""
+
+    def __init__(self, encoder_layer, num_layers):
+        super().__init__()
+        self.layers = nn.ModuleList([copy.deepcopy(encoder_layer) for _ in range(num_layers)])
+
+    def forward(self, src, return_attn=False):
+        output = src
+        attn_layers = []
+        for layer in self.layers:
+            if return_attn:
+                output, attn = layer(output, return_attn=True)
+                attn_layers.append(attn)
+            else:
+                output = layer(output)
+        if return_attn:
+            return output, attn_layers
+        return output
 
 
 def Conv1d_with_init(in_channels, out_channels, kernel_size):
@@ -76,7 +160,7 @@ class diff_CSDI(nn.Module):
             ]
         )
 
-    def forward(self, x, cond_info, diffusion_step, strategy_type, return_hidden=False):
+    def forward(self, x, cond_info, diffusion_step, strategy_type, return_hidden=False, return_feature_attn=False):
         B, inputdim, K, L = x.shape
 
         x = x.reshape(B, inputdim, K * L)
@@ -92,8 +176,19 @@ class diff_CSDI(nn.Module):
         # print("strategy emb is")
         # print(strategy_emb.shape)
         skip = []
+        feature_attn_layers = []
         for layer in self.residual_layers:
-            x, skip_connection = layer(x, cond_info, diffusion_emb,strategy_emb)
+            if return_feature_attn:
+                x, skip_connection, feature_attn = layer(
+                    x,
+                    cond_info,
+                    diffusion_emb,
+                    strategy_emb,
+                    return_feature_attn=True,
+                )
+                feature_attn_layers.append(feature_attn)
+            else:
+                x, skip_connection = layer(x, cond_info, diffusion_emb,strategy_emb)
             skip.append(skip_connection)
 
         x = torch.sum(torch.stack(skip), dim=0) / math.sqrt(len(self.residual_layers))
@@ -103,8 +198,17 @@ class diff_CSDI(nn.Module):
         x = F.relu(x)
         x = self.output_projection2(x)  # (B,1,K*L)
         x = x.reshape(B, K, L)
+        if return_feature_attn:
+            feature_attn = torch.cat(feature_attn_layers, dim=0)
+            feature_attn = feature_attn.permute(1, 2, 0, 3, 4, 5).contiguous()
+            B_attn, L_attn, layer_count, heads, K_attn, _ = feature_attn.shape
+            feature_attn = feature_attn.reshape(B_attn, L_attn, layer_count * heads, K_attn, K_attn)
+        if return_hidden and return_feature_attn:
+            return x, hidden, feature_attn
         if return_hidden:
             return x, hidden
+        if return_feature_attn:
+            return x, feature_attn
         return x
 
 
@@ -130,16 +234,34 @@ class ResidualBlock(nn.Module):
         y = y.reshape(B, K, channel, L).permute(0, 2, 1, 3).reshape(B, channel, K * L)
         return y
 
-    def forward_feature(self, y, base_shape):
+    def forward_feature(self, y, base_shape, return_attn=False):
         B, channel, K, L = base_shape
         if K == 1:
+            if return_attn:
+                return y, None
             return y
         y = y.reshape(B, channel, K, L).permute(0, 3, 1, 2).reshape(B * L, channel, K)
-        y = self.feature_layer(y.permute(2, 0, 1)).permute(1, 2, 0)
+        if return_attn:
+            y, attn_layers = self.feature_layer(y.permute(2, 0, 1), return_attn=True)
+        else:
+            y = self.feature_layer(y.permute(2, 0, 1))
+            attn_layers = None
+        y = y.permute(1, 2, 0)
         y = y.reshape(B, L, channel, K).permute(0, 2, 3, 1).reshape(B, channel, K * L)
+        if return_attn:
+            attn_by_layer = []
+            for attn in attn_layers:
+                if attn is None:
+                    continue
+                if attn.dim() == 3:
+                    attn = attn.unsqueeze(1)
+                attn_by_layer.append(attn.reshape(B, L, attn.shape[1], K, K))
+            if not attn_by_layer:
+                raise RuntimeError("feature attention was requested but not returned")
+            return y, torch.stack(attn_by_layer, dim=0)
         return y
 
-    def forward(self, x, cond_info, diffusion_emb, strategy_emb):
+    def forward(self, x, cond_info, diffusion_emb, strategy_emb, return_feature_attn=False):
         B, channel, K, L = x.shape
         base_shape = x.shape
         x = x.reshape(B, channel, K * L)
@@ -153,7 +275,11 @@ class ResidualBlock(nn.Module):
         y = x + diffusion_emb + strategy_emb
 
         y = self.forward_time(y, base_shape)
-        y = self.forward_feature(y, base_shape)  # (B,channel,K*L)
+        if return_feature_attn:
+            y, feature_attn = self.forward_feature(y, base_shape, return_attn=True)
+        else:
+            y = self.forward_feature(y, base_shape)  # (B,channel,K*L)
+            feature_attn = None
         y = self.mid_projection(y)  # (B,2*channel,K*L)
 
         _, cond_dim, _, _ = cond_info.shape
@@ -169,4 +295,6 @@ class ResidualBlock(nn.Module):
         x = x.reshape(base_shape)
         residual = residual.reshape(base_shape)
         skip = skip.reshape(base_shape)
+        if return_feature_attn:
+            return (x + residual) / math.sqrt(2.0), skip, feature_attn
         return (x + residual) / math.sqrt(2.0), skip

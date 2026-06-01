@@ -32,14 +32,21 @@ parser.add_argument("--diffusion_step",type=int,default=50)
 parser.add_argument("--machine_number",type=int,default=1)
 parser.add_argument("--file",type=str)
 parser.add_argument('--dataset',type=str,default="SMD")
+parser.add_argument("--model_dataset", type=str, default="")
 parser.add_argument("--validation_threshold_root", type=str, default="validation_threshold")
 parser.add_argument("--validation_threshold_ratio", type=float, default=0.02)
 parser.add_argument("--pathB_output_root", type=str, default="pathB_result")
 parser.add_argument("--result_tag", type=str, default="")
 parser.add_argument("--overwrite", action="store_true")
 parser.add_argument("--pathB_mid_step", type=int, default=None)
+parser.add_argument("--pathB_compare_steps", type=str, default="49,45,40,35,30,25,20,15,10,5,0")
+parser.add_argument("--pathB_mode", choices=["self", "proto", "both"], default="self")
+parser.add_argument("--pathB_proto_dataset", type=str, default="")
+parser.add_argument("--pathB_proto_recompute", action="store_true")
 args = parser.parse_args()
 result_tag = args.result_tag or args.dataset
+model_dataset = args.model_dataset or args.dataset
+pathB_proto_dataset = args.pathB_proto_dataset or model_dataset
 
 
 path = "config/" + args.config
@@ -61,6 +68,11 @@ try:
 except:
     pass
 
+if not os.path.isdir("train_result"):
+    raise FileNotFoundError("train_result directory not found. Put save0/save1/save2 under train_result before inference.")
+
+matched_model_count = 0
+available_model_dirs = []
 for iteration in os.listdir("train_result"):
 
     try:
@@ -69,10 +81,12 @@ for iteration in os.listdir("train_result"):
         pass
 
     for subset_name in os.listdir(f"train_result/{iteration}/"):
+        available_model_dirs.append(f"{iteration}/{subset_name}")
 
         data_id = subset_name.split("_unconditional")[0]
-        if data_id != args.dataset:
+        if data_id != model_dataset:
             continue
+        matched_model_count += 1
 
         if "unconditional:True" in subset_name:
             unconditional = True
@@ -87,7 +101,7 @@ for iteration in os.listdir("train_result"):
         label_data_path_list = []
 
 
-        data_file = f"{data_id}_train.pkl"
+        data_file = f"{args.dataset}_train.pkl"
         train_data_path_list.append("data/Machine/" + data_file)
         test_data_path_list.append("data/Machine/" + data_file.replace("_train.pkl","_test.pkl"))
         label_data_path_list.append("data/Machine/" + data_file.replace("_train.pkl","_test_label.pkl"))
@@ -105,6 +119,29 @@ for iteration in os.listdir("train_result"):
             window_split=2,
             split=split
         )
+        pathB_proto_loader = None
+        if args.pathB_mode in ("proto", "both"):
+            proto_train_data_path = f"data/Machine/{pathB_proto_dataset}_train.pkl"
+            proto_test_data_path = f"data/Machine/{pathB_proto_dataset}_test.pkl"
+            proto_label_data_path = f"data/Machine/{pathB_proto_dataset}_test_label.pkl"
+            missing_proto_files = [
+                path
+                for path in [proto_train_data_path, proto_test_data_path, proto_label_data_path]
+                if not os.path.exists(path)
+            ]
+            if missing_proto_files:
+                raise FileNotFoundError(
+                    "pathB proto mode requires normal prototype data files:\n"
+                    + "\n".join(missing_proto_files)
+                )
+            _, pathB_proto_loader, _, _ = get_dataloader(
+                proto_train_data_path,
+                proto_test_data_path,
+                proto_label_data_path,
+                batch_size=24,
+                window_split=2,
+                split=split,
+            )
         base_folder = f"train_result/{iteration}/{subset_name}"
         config_path = f"{base_folder}/config.json"
         if os.path.exists(config_path):
@@ -152,9 +189,14 @@ for iteration in os.listdir("train_result"):
             pass
 
         os.makedirs(f"window_result/{iteration}/{diffusion_step}", exist_ok=True)#改过代码
-        target_folder = f"window_result/{iteration}/{diffusion_step}/{subset_name}"
+        if data_id == args.dataset:
+            output_subset_name = subset_name
+        else:
+            output_subset_name = subset_name.replace(f"{data_id}_", f"{args.dataset}_", 1)
+
+        target_folder = f"window_result/{iteration}/{diffusion_step}/{output_subset_name}"
         os.makedirs(target_folder, exist_ok=True)
-        validation_threshold_folder = f"{args.validation_threshold_root}/{iteration}/{diffusion_step}/{subset_name}"
+        validation_threshold_folder = f"{args.validation_threshold_root}/{iteration}/{diffusion_step}/{output_subset_name}"
         os.makedirs(validation_threshold_folder, exist_ok=True)
 
         for temp_i in range(0,1):
@@ -182,6 +224,11 @@ for iteration in os.listdir("train_result"):
                     run_id=iteration,
                     overwrite=args.overwrite,
                     pathB_mid_step=args.pathB_mid_step,
+                    pathB_compare_steps=args.pathB_compare_steps,
+                    pathB_mode=args.pathB_mode,
+                    pathB_proto_loader=pathB_proto_loader,
+                    pathB_proto_dataset=pathB_proto_dataset,
+                    pathB_proto_recompute=args.pathB_proto_recompute,
                 )
                 compute_abs = True
                 compute_sum = True
@@ -206,3 +253,13 @@ for iteration in os.listdir("train_result"):
                 window_trick_evaluate_middle(model, train_error_loader_list, test_loader_list, nsample=1, scaler=1,
                                   foldername=target_folder,
                                   epoch_number=0, name=str(temp_i),split=split)
+
+if matched_model_count == 0:
+    available_text = "\n".join(available_model_dirs[:50])
+    raise FileNotFoundError(
+        f"No train_result model directory matched --model_dataset {model_dataset}.\n"
+        "Expected a directory like train_result/save0/"
+        f"{model_dataset}_unconditional:..._diffusion_step:50\n"
+        "Use --model_dataset only if the checkpoint prefix differs from --dataset.\n"
+        f"Available model directories:\n{available_text}"
+    )

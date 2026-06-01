@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.optim import Adam
 from tqdm import tqdm
 import pickle
@@ -15,6 +16,170 @@ def ensure_outputs_can_be_written(paths, overwrite=False):
             "output already exists. Pass --overwrite to replace:\n"
             f"{existing_text}"
         )
+
+
+def compute_pathB_raw_proto_score(hidden, prototype):
+    B, C, K, L = hidden.shape
+    h_feature = hidden.permute(0, 3, 2, 1)  # (B,L,K,C)
+    prototype = prototype.to(hidden.device).to(hidden.dtype)
+    return 1.0 - F.cosine_similarity(
+        h_feature,
+        prototype.reshape(1, 1, K, C),
+        dim=-1,
+        eps=1e-8,
+    )
+
+
+def get_pathB_score_names(model, pathB_mode, pathB_mid_step, pathB_compare_steps):
+    pathB_mode = pathB_mode or "self"
+    include_proto = pathB_mode in ("proto", "both")
+    include_self = pathB_mode in ("self", "both")
+    compare_steps = model.resolve_pathB_compare_steps(
+        pathB_mid_step,
+        pathB_compare_steps,
+        include_zero=include_proto,
+    )
+    primary_pathB_step = model.num_steps // 2 if pathB_mid_step is None else pathB_mid_step
+    primary_pathB_step = max(0, min(int(primary_pathB_step), model.num_steps - 1))
+
+    self_score_names = [
+        "pathB_feature_score",
+        "pathB_feature_score_max",
+        "pathB_feature_score_top3",
+    ]
+    proto_score_names = [
+        "pathB_proto_score_top3",
+        "pathB_proto_score_max",
+    ]
+
+    score_names = []
+    for step in compare_steps:
+        if include_self and step != 0:
+            if step == primary_pathB_step:
+                score_names.extend(self_score_names)
+            score_names.extend(f"{score_name}_t{step}" for score_name in self_score_names)
+        if include_proto:
+            score_names.extend(f"{score_name}_t{step}" for score_name in proto_score_names)
+
+    return compare_steps, score_names
+
+
+def build_or_load_pathB_normal_prototype(
+        model,
+        proto_loader,
+        nsample,
+        pathB_output_root,
+        pathB_proto_dataset,
+        run_id,
+        pathB_mid_step=None,
+        pathB_compare_steps=None,
+        overwrite=False,
+        recompute=False,
+):
+    if proto_loader is None:
+        raise ValueError("pathB proto mode requires a normal validation loader")
+
+    safe_run_id = str(run_id) if str(run_id) else "run"
+    proto_dataset = pathB_proto_dataset or "normal"
+    prototype_folder = os.path.join(pathB_output_root, "_prototypes", proto_dataset)
+    prototype_path = os.path.join(prototype_folder, f"normal_prototype_{safe_run_id}.pt")
+
+    if os.path.exists(prototype_path) and not recompute:
+        return torch.load(prototype_path, map_location="cpu"), prototype_path
+
+    ensure_outputs_can_be_written([prototype_path], overwrite=overwrite)
+    os.makedirs(prototype_folder, exist_ok=True)
+
+    compare_steps = model.resolve_pathB_compare_steps(
+        pathB_mid_step,
+        pathB_compare_steps,
+        include_zero=True,
+    )
+    step_metadata = model.build_pathB_step_metadata(compare_steps)
+    model.eval()
+
+    hidden_sum_by_step = {int(step): None for step in compare_steps}
+    hidden_count_by_step = {int(step): 0 for step in compare_steps}
+
+    with torch.no_grad():
+        with tqdm(proto_loader, desc=f"pathB proto mean {safe_run_id}", mininterval=5.0, maxinterval=50.0) as it:
+            for valid_batch in it:
+                output = model.get_middle_evaluate(
+                    valid_batch,
+                    nsample,
+                    return_pathB=True,
+                    pathB_mid_step=pathB_mid_step,
+                    pathB_compare_steps=pathB_compare_steps,
+                    pathB_mode="hidden",
+                    return_pathB_hidden=True,
+                )
+                hidden_by_step = output[-1]["hidden_by_step"]
+                for step in compare_steps:
+                    step = int(step)
+                    hidden = hidden_by_step[step]
+                    hidden_feature = hidden.permute(0, 3, 2, 1)  # (B,L,K,C)
+                    hidden_sum = hidden_feature.sum(dim=(0, 1)).detach().cpu()
+                    hidden_count = hidden_feature.shape[0] * hidden_feature.shape[1]
+                    if hidden_sum_by_step[step] is None:
+                        hidden_sum_by_step[step] = hidden_sum
+                    else:
+                        hidden_sum_by_step[step] += hidden_sum
+                    hidden_count_by_step[step] += hidden_count
+
+    prototype_by_step = {
+        step: hidden_sum_by_step[step] / max(hidden_count_by_step[step], 1)
+        for step in hidden_sum_by_step
+    }
+
+    raw_score_chunks_by_step = {int(step): [] for step in compare_steps}
+    with torch.no_grad():
+        with tqdm(proto_loader, desc=f"pathB proto calibration {safe_run_id}", mininterval=5.0, maxinterval=50.0) as it:
+            for valid_batch in it:
+                output = model.get_middle_evaluate(
+                    valid_batch,
+                    nsample,
+                    return_pathB=True,
+                    pathB_mid_step=pathB_mid_step,
+                    pathB_compare_steps=pathB_compare_steps,
+                    pathB_mode="hidden",
+                    return_pathB_hidden=True,
+                )
+                hidden_by_step = output[-1]["hidden_by_step"]
+                for step in compare_steps:
+                    step = int(step)
+                    raw_score = compute_pathB_raw_proto_score(
+                        hidden_by_step[step],
+                        prototype_by_step[step],
+                    )
+                    raw_score_chunks_by_step[step].append(raw_score.reshape(-1, raw_score.shape[-1]).detach().cpu())
+
+    median_by_step = {}
+    mad_by_step = {}
+    normal_score_mean_by_step = {}
+    normal_score_std_by_step = {}
+    for step, chunks in raw_score_chunks_by_step.items():
+        raw_scores = torch.cat(chunks, dim=0)
+        median = raw_scores.median(dim=0).values
+        mad = torch.abs(raw_scores - median.reshape(1, -1)).median(dim=0).values
+        median_by_step[step] = median
+        mad_by_step[step] = mad
+        normal_score_mean_by_step[step] = raw_scores.mean(dim=0)
+        normal_score_std_by_step[step] = raw_scores.std(dim=0, unbiased=False)
+
+    prototype_stats = {
+        "prototype_by_step": prototype_by_step,
+        "median_by_step": median_by_step,
+        "mad_by_step": mad_by_step,
+        "normal_score_mean_by_step": normal_score_mean_by_step,
+        "normal_score_std_by_step": normal_score_std_by_step,
+        "step_metadata": step_metadata,
+        "pathB_compare_steps": compare_steps,
+        "proto_dataset": proto_dataset,
+        "run_id": safe_run_id,
+        "score_calibration": "median_mad_clamp_positive",
+    }
+    torch.save(prototype_stats, prototype_path)
+    return prototype_stats, prototype_path
 
 
 def train(
@@ -699,6 +864,11 @@ def reconstruction_window_trick_evaluate_middle(
         run_id="",
         overwrite=False,
         pathB_mid_step=None,
+        pathB_compare_steps=None,
+        pathB_mode="self",
+        pathB_proto_loader=None,
+        pathB_proto_dataset=None,
+        pathB_proto_recompute=False,
 ):
 
     with torch.no_grad():
@@ -714,9 +884,18 @@ def reconstruction_window_trick_evaluate_middle(
         all_generated_samples = []
         all_middle = []
         all_final_recon_score = []
-        all_pathB_feature_score = []
+        pathB_mode = pathB_mode or "self"
+        resolved_compare_steps, pathB_score_names = get_pathB_score_names(
+            model,
+            pathB_mode,
+            pathB_mid_step,
+            pathB_compare_steps,
+        )
+        all_pathB_scores = {score_name: [] for score_name in pathB_score_names}
         pathB_enabled = pathB_output_root is not None and result_tag is not None
         pathB_metadata = {}
+        pathB_proto_stats = None
+        pathB_proto_cache_path = None
         safe_run_id = str(run_id) if str(run_id) else "run"
 
         if pathB_enabled:
@@ -725,20 +904,36 @@ def reconstruction_window_trick_evaluate_middle(
             pathB_inference_path = os.path.join(inference_folder, f"window_scores_{safe_run_id}.pt")
             pathB_inference_meta_path = os.path.join(inference_folder, f"metadata_{safe_run_id}.json")
             final_recon_score_path = os.path.join(ensemble_folder, f"final_recon_score_ensemble_{safe_run_id}.pt")
-            pathB_feature_score_path = os.path.join(ensemble_folder, f"pathB_feature_score_ensemble_{safe_run_id}.pt")
+            pathB_score_paths = {
+                score_name: os.path.join(ensemble_folder, f"{score_name}_ensemble_{safe_run_id}.pt")
+                for score_name in pathB_score_names
+            }
             pathB_ensemble_meta_path = os.path.join(ensemble_folder, f"metadata_{safe_run_id}.json")
             ensure_outputs_can_be_written(
                 [
                     pathB_inference_path,
                     pathB_inference_meta_path,
                     final_recon_score_path,
-                    pathB_feature_score_path,
+                    *pathB_score_paths.values(),
                     pathB_ensemble_meta_path,
                 ],
                 overwrite=overwrite,
             )
             os.makedirs(inference_folder, exist_ok=True)
             os.makedirs(ensemble_folder, exist_ok=True)
+            if pathB_mode in ("proto", "both"):
+                pathB_proto_stats, pathB_proto_cache_path = build_or_load_pathB_normal_prototype(
+                    model,
+                    pathB_proto_loader,
+                    nsample,
+                    pathB_output_root,
+                    pathB_proto_dataset,
+                    safe_run_id,
+                    pathB_mid_step=pathB_mid_step,
+                    pathB_compare_steps=pathB_compare_steps,
+                    overwrite=overwrite,
+                    recompute=pathB_proto_recompute,
+                )
 
         with tqdm(test_loader, mininterval=5.0, maxinterval=50.0) as it:
             for batch_no, test_batch in enumerate(it, start=1):
@@ -751,12 +946,20 @@ def reconstruction_window_trick_evaluate_middle(
                     nsample,
                     return_pathB=pathB_enabled,
                     pathB_mid_step=pathB_mid_step,
+                    pathB_compare_steps=pathB_compare_steps,
+                    pathB_mode=pathB_mode,
+                    pathB_proto_stats=pathB_proto_stats,
                 )
                 if pathB_enabled:
                     samples, c_target, eval_points, observed_points, observed_time, middle_result, batch_pathB = output
                     final_recon_score = batch_pathB["final_recon_score"]
-                    pathB_feature_score = batch_pathB["pathB_feature_score"]
+                    pathB_scores = {
+                        score_name: batch_pathB[score_name]
+                        for score_name in pathB_score_names
+                    }
                     pathB_metadata["pathB_mid_step"] = batch_pathB["pathB_mid_step"]
+                    pathB_metadata["pathB_compare_steps"] = batch_pathB["pathB_compare_steps"]
+                    pathB_metadata["pathB_step_metadata"] = batch_pathB.get("pathB_step_metadata", {})
                 else:
                     samples, c_target, eval_points, observed_points, observed_time, middle_result = output
 
@@ -774,7 +977,10 @@ def reconstruction_window_trick_evaluate_middle(
                     head_middle = middle_result[0, :, 0: L // split, :]
                     if pathB_enabled:
                         head_final_recon_score = final_recon_score[0, 0: L // split]
-                        head_pathB_feature_score = pathB_feature_score[0, 0: L // split]
+                        head_pathB_scores = {
+                            score_name: pathB_scores[score_name][0, 0: L // split]
+                            for score_name in pathB_score_names
+                        }
 
                 samples = samples[:, :, L // split: L - L // split, :]
                 c_target = c_target[:, L // split: L - L // split, :]
@@ -782,7 +988,10 @@ def reconstruction_window_trick_evaluate_middle(
                 middle_result = middle_result[:, :, L // split: L - L // split, :]
                 if pathB_enabled:
                     final_recon_score = final_recon_score[:, L // split: L - L // split]
-                    pathB_feature_score = pathB_feature_score[:, L // split: L - L // split]
+                    pathB_scores = {
+                        score_name: pathB_scores[score_name][:, L // split: L - L // split]
+                        for score_name in pathB_score_names
+                    }
 
                 samples_median = samples.median(dim=1).values
                 eval_points = torch.ones_like(samples_median)
@@ -795,7 +1004,8 @@ def reconstruction_window_trick_evaluate_middle(
                 all_middle.append(middle_result)
                 if pathB_enabled:
                     all_final_recon_score.append(final_recon_score.detach().cpu())
-                    all_pathB_feature_score.append(pathB_feature_score.detach().cpu())
+                    for score_name in pathB_score_names:
+                        all_pathB_scores[score_name].append(pathB_scores[score_name].detach().cpu())
 
                 mse_current = ((samples_median - c_target) ** 2) * (scaler ** 2)
                 mae_current = torch.abs(samples_median - c_target) * scaler
@@ -847,43 +1057,70 @@ def reconstruction_window_trick_evaluate_middle(
 
             if pathB_enabled:
                 final_recon_score_windows = torch.cat(all_final_recon_score, dim=0).to("cpu")
-                pathB_feature_score_windows = torch.cat(all_pathB_feature_score, dim=0).to("cpu")
                 head_final_recon_score = head_final_recon_score.to("cpu")
-                head_pathB_feature_score = head_pathB_feature_score.to("cpu")
+                pathB_score_windows = {
+                    score_name: torch.cat(all_pathB_scores[score_name], dim=0).to("cpu")
+                    for score_name in pathB_score_names
+                }
+                head_pathB_scores = {
+                    score_name: head_pathB_scores[score_name].to("cpu")
+                    for score_name in pathB_score_names
+                }
 
                 final_recon_score_ensemble = torch.cat(
                     [head_final_recon_score.reshape(-1), final_recon_score_windows.reshape(-1)],
                     dim=0,
                 )
-                pathB_feature_score_ensemble = torch.cat(
-                    [head_pathB_feature_score.reshape(-1), pathB_feature_score_windows.reshape(-1)],
-                    dim=0,
-                )
+                pathB_score_ensembles = {}
+                for score_name in pathB_score_names:
+                    pathB_score_ensembles[score_name] = torch.cat(
+                        [
+                            head_pathB_scores[score_name].reshape(-1),
+                            pathB_score_windows[score_name].reshape(-1),
+                        ],
+                        dim=0,
+                    )
 
                 common_metadata = {
                     "result_tag": result_tag,
                     "run_id": safe_run_id,
                     "pathB_mid_step": pathB_metadata.get("pathB_mid_step"),
+                    "pathB_mode": pathB_mode,
+                    "pathB_proto_dataset": pathB_proto_dataset,
+                    "pathB_proto_cache_path": pathB_proto_cache_path,
+                    "pathB_compare_steps": pathB_metadata.get("pathB_compare_steps", resolved_compare_steps),
+                    "pathB_step_metadata": pathB_metadata.get("pathB_step_metadata", {}),
+                    "pathB_score_names": pathB_score_names,
                     "nsample": nsample,
                     "split": split,
                     "score_shape": {
                         "final_recon_score_ensemble": list(final_recon_score_ensemble.shape),
-                        "pathB_feature_score_ensemble": list(pathB_feature_score_ensemble.shape),
+                        **{
+                            f"{score_name}_ensemble": list(pathB_score_ensembles[score_name].shape)
+                            for score_name in pathB_score_names
+                        },
                     },
                 }
 
                 torch.save(
                     {
                         "final_recon_score_windows": final_recon_score_windows,
-                        "pathB_feature_score_windows": pathB_feature_score_windows,
                         "head_final_recon_score": head_final_recon_score,
-                        "head_pathB_feature_score": head_pathB_feature_score,
+                        **{
+                            f"{score_name}_windows": pathB_score_windows[score_name]
+                            for score_name in pathB_score_names
+                        },
+                        **{
+                            f"head_{score_name}": head_pathB_scores[score_name]
+                            for score_name in pathB_score_names
+                        },
                         **common_metadata,
                     },
                     pathB_inference_path,
                 )
                 torch.save(final_recon_score_ensemble, final_recon_score_path)
-                torch.save(pathB_feature_score_ensemble, pathB_feature_score_path)
+                for score_name in pathB_score_names:
+                    torch.save(pathB_score_ensembles[score_name], pathB_score_paths[score_name])
 
                 with open(pathB_inference_meta_path, "w") as f:
                     json.dump(common_metadata, f, indent=4)

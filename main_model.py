@@ -189,11 +189,81 @@ class CSDI_base(nn.Module):
 
         return reconstructed_samples
 
-    def compute_pathB_feature_score(self, h_mid, h_final):
+    def resolve_pathB_compare_steps(self, pathB_mid_step=None, pathB_compare_steps=None, include_zero=False):
+        last_step = self.num_steps - 1
+        if pathB_compare_steps is None:
+            raw_steps = [self.num_steps // 2 if pathB_mid_step is None else pathB_mid_step]
+        elif isinstance(pathB_compare_steps, str):
+            raw_steps = pathB_compare_steps.replace(",", " ").split()
+        else:
+            raw_steps = list(pathB_compare_steps)
+
+        steps = []
+        for step in raw_steps:
+            step = max(0, min(int(step), last_step))
+            if step == 0 and not include_zero:
+                continue
+            if step not in steps:
+                steps.append(step)
+
+        if not steps:
+            fallback_step = self.num_steps // 2 if pathB_mid_step is None else pathB_mid_step
+            lower_bound = 0 if include_zero else 1
+            fallback_step = max(lower_bound, min(int(fallback_step), last_step))
+            steps.append(fallback_step)
+        return steps
+
+    def build_pathB_step_metadata(self, compare_steps):
+        return {
+            int(step): {
+                "requested_step": int(step),
+                "actual_diffusion_t": int(step),
+                "hidden_store_index": int(step),
+                "num_diffusion_steps": int(self.num_steps),
+                "reverse_order_used": True,
+            }
+            for step in compare_steps
+        }
+
+    def compute_pathB_feature_score(self, h_mid, h_final, topk=3):
         B, C, K, L = h_mid.shape
-        h_mid = h_mid.permute(0, 3, 1, 2).reshape(B, L, C * K)
-        h_final = h_final.permute(0, 3, 1, 2).reshape(B, L, C * K)
-        return 1.0 - F.cosine_similarity(h_mid, h_final, dim=-1, eps=1e-8)
+        h_mid_global = h_mid.permute(0, 3, 1, 2).reshape(B, L, C * K)
+        h_final_global = h_final.permute(0, 3, 1, 2).reshape(B, L, C * K)
+        global_score = 1.0 - F.cosine_similarity(h_mid_global, h_final_global, dim=-1, eps=1e-8)
+
+        h_mid_feature = h_mid.permute(0, 3, 2, 1)  # (B,L,K,C)
+        h_final_feature = h_final.permute(0, 3, 2, 1)
+        per_feature_score = 1.0 - F.cosine_similarity(h_mid_feature, h_final_feature, dim=-1, eps=1e-8)
+        feature_max_score = per_feature_score.max(dim=-1).values
+        feature_topk_score = per_feature_score.topk(k=min(topk, K), dim=-1).values.mean(dim=-1)
+
+        return {
+            "pathB_feature_score": global_score,
+            "pathB_feature_score_max": feature_max_score,
+            "pathB_feature_score_top3": feature_topk_score,
+        }
+
+    def compute_pathB_proto_score(self, hidden, pathB_proto_stats, step, topk=3):
+        B, C, K, L = hidden.shape
+        h_feature = hidden.permute(0, 3, 2, 1)  # (B,L,K,C)
+
+        prototype = pathB_proto_stats["prototype_by_step"][int(step)].to(hidden.device).to(hidden.dtype)
+        median = pathB_proto_stats["median_by_step"][int(step)].to(hidden.device).to(hidden.dtype)
+        mad = pathB_proto_stats["mad_by_step"][int(step)].to(hidden.device).to(hidden.dtype)
+
+        raw_score = 1.0 - F.cosine_similarity(
+            h_feature,
+            prototype.reshape(1, 1, K, C),
+            dim=-1,
+            eps=1e-8,
+        )
+        z_score = (raw_score - median.reshape(1, 1, K)) / (mad.reshape(1, 1, K) + 1e-6)
+        z_score = torch.clamp(z_score, min=0.0)
+
+        return {
+            "pathB_proto_score_max": z_score.max(dim=-1).values,
+            "pathB_proto_score_top3": z_score.topk(k=min(topk, K), dim=-1).values.mean(dim=-1),
+        }
 
     def get_middle_reconstruct_value(
         self,
@@ -204,6 +274,11 @@ class CSDI_base(nn.Module):
         strategy_type,
         return_pathB=False,
         pathB_mid_step=None,
+        pathB_compare_steps=None,
+        pathB_mode="self",
+        pathB_proto_stats=None,
+        return_pathB_hidden=False,
+        return_pathB_attention=False,
     ):
         B, K, L = observed_data.shape
         reconstructed_samples = torch.zeros(B, n_samples, K, L).to(self.device)
@@ -212,8 +287,19 @@ class CSDI_base(nn.Module):
         if pathB_mid_step is None:
             pathB_mid_step = self.num_steps // 2
         pathB_mid_step = max(0, min(int(pathB_mid_step), last_step))
-        h_mid = None
+        pathB_mode = pathB_mode or "self"
+        compute_self_scores = pathB_mode in ("self", "both")
+        compute_proto_scores = pathB_mode in ("proto", "both") and pathB_proto_stats is not None
+        include_zero = compute_proto_scores or return_pathB_hidden or return_pathB_attention
+        compare_steps = self.resolve_pathB_compare_steps(
+            pathB_mid_step,
+            pathB_compare_steps,
+            include_zero=include_zero,
+        )
+        hidden_required = compute_self_scores or compute_proto_scores or return_pathB_hidden
+        h_compare = {}
         h_final = None
+        attention_compare = {}
         final_recon_score = None
 
         for i in range(n_samples):
@@ -224,19 +310,35 @@ class CSDI_base(nn.Module):
 
             for t in range(last_step, -1, -1):
                 diff_input = self.set_input_to_diffmodel(current_sample, observed_data, cond_mask)
-                capture_hidden = return_pathB and (t == pathB_mid_step or t == 0)
-                if capture_hidden:
-                    predicted, hidden = self.diffmodel(
+                capture_hidden = return_pathB and hidden_required and (t in compare_steps or t == 0)
+                capture_attention = return_pathB and return_pathB_attention and (t in compare_steps)
+                if capture_hidden or capture_attention:
+                    diff_output = self.diffmodel(
                         diff_input,
                         side_info,
                         torch.tensor([t]).to(self.device),
                         strategy_type,
-                        return_hidden=True,
+                        return_hidden=capture_hidden,
+                        return_feature_attn=capture_attention,
                     )
-                    if t == pathB_mid_step:
-                        h_mid = hidden.detach()
+                    hidden = None
+                    feature_attn = None
+                    if capture_hidden and capture_attention:
+                        predicted, hidden, feature_attn = diff_output
+                    elif capture_hidden:
+                        predicted, hidden = diff_output
+                    else:
+                        predicted, feature_attn = diff_output
+                    if t in compare_steps:
+                        if hidden is not None:
+                            h_compare[t] = hidden.detach()
+                        if feature_attn is not None:
+                            # Average residual-block/head attention sources to keep the
+                            # returned topology compact: [B,L,A,K,K] -> [B,L,K,K].
+                            attention_compare[t] = feature_attn.detach().mean(dim=2).cpu()
                     if t == 0:
-                        h_final = hidden.detach()
+                        if hidden is not None:
+                            h_final = hidden.detach()
                 else:
                     predicted = self.diffmodel(
                         diff_input,
@@ -258,13 +360,39 @@ class CSDI_base(nn.Module):
                 final_recon_score = torch.sum(torch.abs(reconstructed.detach() - observed_data), dim=1)
 
         if return_pathB:
-            if h_mid is None or h_final is None:
+            if hidden_required and (h_final is None or any(step not in h_compare for step in compare_steps)):
                 raise RuntimeError("pathB hidden features were not captured during reconstruction")
+            if return_pathB_attention and any(step not in attention_compare for step in compare_steps):
+                raise RuntimeError("pathB feature attention weights were not captured during reconstruction")
             pathB_result = {
                 "pathB_mid_step": pathB_mid_step,
+                "pathB_compare_steps": compare_steps,
+                "pathB_step_metadata": self.build_pathB_step_metadata(compare_steps),
                 "final_recon_score": final_recon_score.detach(),
-                "pathB_feature_score": self.compute_pathB_feature_score(h_mid, h_final).detach(),
             }
+            if return_pathB_hidden:
+                pathB_result["hidden_by_step"] = {
+                    int(step): h_compare[step].detach()
+                    for step in compare_steps
+                }
+            if return_pathB_attention:
+                pathB_result["feature_attention_by_step"] = {
+                    int(step): attention_compare[step]
+                    for step in compare_steps
+                }
+            for step in compare_steps:
+                if compute_self_scores and step != 0:
+                    for score_name, score in self.compute_pathB_feature_score(h_compare[step], h_final).items():
+                        pathB_result[f"{score_name}_t{step}"] = score.detach()
+                        if step == pathB_mid_step:
+                            pathB_result[score_name] = score.detach()
+                if compute_proto_scores:
+                    for score_name, score in self.compute_pathB_proto_score(
+                        h_compare[step],
+                        pathB_proto_stats,
+                        step,
+                    ).items():
+                        pathB_result[f"{score_name}_t{step}"] = score.detach()
             return reconstructed_samples, reconstructed_middle_samples, pathB_result
         return reconstructed_samples, reconstructed_middle_samples
 
@@ -494,7 +622,18 @@ class CSDI_base(nn.Module):
         # 此处target_mask给的是那些待预测的点
         return samples, observed_data, target_mask, observed_mask, observed_tp
 
-    def get_middle_evaluate(self, batch, n_samples, return_pathB=False, pathB_mid_step=None):
+    def get_middle_evaluate(
+        self,
+        batch,
+        n_samples,
+        return_pathB=False,
+        pathB_mid_step=None,
+        pathB_compare_steps=None,
+        pathB_mode="self",
+        pathB_proto_stats=None,
+        return_pathB_hidden=False,
+        return_pathB_attention=False,
+    ):
         (
             observed_data,
             observed_mask,
@@ -521,6 +660,11 @@ class CSDI_base(nn.Module):
                         strategy_type,
                         return_pathB=True,
                         pathB_mid_step=pathB_mid_step,
+                        pathB_compare_steps=pathB_compare_steps,
+                        pathB_mode=pathB_mode,
+                        pathB_proto_stats=pathB_proto_stats,
+                        return_pathB_hidden=return_pathB_hidden,
+                        return_pathB_attention=return_pathB_attention,
                     )
                 else:
                     samples, reconstructed_middle_samples = self.get_middle_reconstruct_value(
