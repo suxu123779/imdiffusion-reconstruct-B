@@ -553,12 +553,22 @@ def main():
     )
     parser.add_argument("--alpha_metric", choices=["auc_roc", "auc_pr", "ap"], default="auc_roc")
     parser.add_argument(
+        "--include_per_save",
+        action="store_true",
+        help="Also write per-save rows. Off by default; main result averages per-save metrics.",
+    )
+    parser.add_argument(
         "--include_score_mean",
         action="store_true",
-        help="Also evaluate score-level save averaging. Off by default; main ensemble is save_metric_mean.",
+        help="Also evaluate score-level save averaging. Off by default; main result averages per-save metrics.",
     )
     parser.add_argument("--no_save_metric_mean", action="store_true")
     parser.add_argument("--no_alpha_search", action="store_true")
+    parser.add_argument(
+        "--include_alpha_per_save",
+        action="store_true",
+        help="Also write per-save alpha-search rows. Off by default; alpha search averages per-save metrics.",
+    )
     args = parser.parse_args()
 
     alphas = parse_alpha_values(args.alpha_values)
@@ -572,23 +582,25 @@ def main():
                 f"{os.path.join(args.pathB_output_root, args.base_dataset)}"
             )
         loaded_files = [load_score_file(path, variant) for path in paths]
-        for path in paths:
-            loaded = next(loaded for loaded in loaded_files if loaded["path"] == path)
-            rows.extend(evaluate_loaded_file(loaded, variant, args.methods))
+        if args.include_per_save:
+            for path in paths:
+                loaded = next(loaded for loaded in loaded_files if loaded["path"] == path)
+                rows.extend(evaluate_loaded_file(loaded, variant, args.methods))
         if args.include_score_mean:
             rows.extend(evaluate_score_mean(loaded_files, variant, args.methods))
         if not args.no_save_metric_mean:
             rows.extend(evaluate_save_metric_mean(loaded_files, variant, args.methods))
         if not args.no_alpha_search:
-            rows.extend(
-                evaluate_alpha_search_per_save(
-                    loaded_files,
-                    variant,
-                    fusion_base_methods,
-                    alphas,
-                    args.alpha_metric,
+            if args.include_alpha_per_save:
+                rows.extend(
+                    evaluate_alpha_search_per_save(
+                        loaded_files,
+                        variant,
+                        fusion_base_methods,
+                        alphas,
+                        args.alpha_metric,
+                    )
                 )
-            )
             rows.extend(
                 evaluate_alpha_search_save_metric_mean(
                     loaded_files,

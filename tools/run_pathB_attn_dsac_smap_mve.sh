@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # One-click runner for real feature-attention DSAC on SMAP-MVE.
-# Prototype is always built from base_dataset=SMAP train 5% validation split.
+# Prototype/CDF are built from base_dataset=SMAP training data; the 5% split is
+# only used for robust z calibration in fusion.
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DEVICE="${DEVICE:-cuda:1}"
@@ -15,6 +16,7 @@ SEED="${SEED:-0}"
 BATCH_SIZE="${BATCH_SIZE:-24}"
 SPLIT="${SPLIT:-4}"
 RIDGE="${RIDGE:-1e-4}"
+EMA_BETA="${EMA_BETA:-0.99}"
 TOP_R_DESCRIPTOR="${TOP_R_DESCRIPTOR:-3}"
 CHANNEL_TOPK="${CHANNEL_TOPK:-3}"
 FUSION_ALPHA="${FUSION_ALPHA:-0.5}"
@@ -28,39 +30,27 @@ EVAL_VARIANTS_TEXT="${EVAL_VARIANTS:-SMAP_MVE_d01 SMAP_MVE_d02 SMAP_MVE_d03 SMAP
 
 METHODS=(
   final_recon_score
-  attn_dsac_ch_mean_step_mean
-  attn_dsac_ch_mean_step_median
-  attn_dsac_ch_mean_step_max
-  attn_dsac_ch_max_step_mean
-  attn_dsac_ch_max_step_median
-  attn_dsac_ch_max_step_max
-  attn_dsac_ch_top3_step_mean
-  attn_dsac_ch_top3_step_median
-  attn_dsac_ch_top3_step_max
-  attn_dsac_ch_top3_step_top2mean
-  fused_attn_dsac_ch_mean_step_mean
-  fused_attn_dsac_ch_mean_step_median
-  fused_attn_dsac_ch_mean_step_max
-  fused_attn_dsac_ch_max_step_mean
-  fused_attn_dsac_ch_max_step_median
-  fused_attn_dsac_ch_max_step_max
-  fused_attn_dsac_ch_top3_step_mean
-  fused_attn_dsac_ch_top3_step_median
-  fused_attn_dsac_ch_top3_step_max
-  fused_attn_dsac_ch_top3_step_top2mean
+  attn_dsac_ch_top3_head_mean_step_median
+  attn_dsac_ch_top3_head_mean_step_mean
+  attn_dsac_ch_top3_head_mean_step_max
+  attn_dsac_ch_top3_head_max_step_median
+  attn_dsac_ch_top3_head_max_step_mean
+  attn_dsac_ch_top3_head_max_step_max
+  fused_attn_dsac_ch_top3_head_mean_step_median
+  fused_attn_dsac_ch_top3_head_mean_step_mean
+  fused_attn_dsac_ch_top3_head_mean_step_max
+  fused_attn_dsac_ch_top3_head_max_step_median
+  fused_attn_dsac_ch_top3_head_max_step_mean
+  fused_attn_dsac_ch_top3_head_max_step_max
 )
 
 FUSION_BASE_METHODS=(
-  attn_dsac_ch_mean_step_mean
-  attn_dsac_ch_mean_step_median
-  attn_dsac_ch_mean_step_max
-  attn_dsac_ch_max_step_mean
-  attn_dsac_ch_max_step_median
-  attn_dsac_ch_max_step_max
-  attn_dsac_ch_top3_step_mean
-  attn_dsac_ch_top3_step_median
-  attn_dsac_ch_top3_step_max
-  attn_dsac_ch_top3_step_top2mean
+  attn_dsac_ch_top3_head_mean_step_median
+  attn_dsac_ch_top3_head_mean_step_mean
+  attn_dsac_ch_top3_head_mean_step_max
+  attn_dsac_ch_top3_head_max_step_median
+  attn_dsac_ch_top3_head_max_step_mean
+  attn_dsac_ch_top3_head_max_step_max
 )
 
 read -r -a SAVE_LIST <<< "${SAVES_TEXT}"
@@ -79,6 +69,7 @@ echo "[ATTN-DSAC-BATCH] device=${DEVICE}"
 echo "[ATTN-DSAC-BATCH] output_root=${OUTPUT_ROOT}"
 echo "[ATTN-DSAC-BATCH] selected_steps=${SELECTED_STEPS}"
 echo "[ATTN-DSAC-BATCH] saves=${SAVE_LIST[*]}"
+echo "[ATTN-DSAC-BATCH] ema_beta=${EMA_BETA}"
 echo "[ATTN-DSAC-BATCH] alpha_values=${ALPHA_VALUES}"
 echo "[ATTN-DSAC-BATCH] alpha_metric=${ALPHA_METRIC}"
 
@@ -105,6 +96,7 @@ for save_id in "${SAVE_LIST[@]}"; do
     --batch_size "${BATCH_SIZE}" \
     --split "${SPLIT}" \
     --ridge "${RIDGE}" \
+    --ema_beta "${EMA_BETA}" \
     --top_r_descriptor "${TOP_R_DESCRIPTOR}" \
     --channel_topk "${CHANNEL_TOPK}" \
     --output_root "${OUTPUT_ROOT}" \

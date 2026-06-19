@@ -4,6 +4,7 @@ import sys
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -24,8 +25,8 @@ from generate_pathB_hdsac_scores import (
     build_validation_loader,
     build_variant_loader,
     check_dataset_label_sum,
-    descriptor_mahalanobis,
-    empirical_cdf_scores,
+    data_paths,
+    ensure_paths_exist,
     load_labels,
     require_no_mve_name,
     robust_norm_stats,
@@ -33,23 +34,35 @@ from generate_pathB_hdsac_scores import (
     selected_steps_key,
     set_all_seeds,
 )
+from dataset import TrainData
 from utils import ensure_outputs_can_be_written
 
 
 DEFAULT_SELECTED_STEPS = "40,25,10,0"
 ATTN_DSAC_METHODS = [
-    "attn_dsac_ch_mean_step_mean",
-    "attn_dsac_ch_mean_step_median",
-    "attn_dsac_ch_mean_step_max",
-    "attn_dsac_ch_max_step_mean",
-    "attn_dsac_ch_max_step_median",
-    "attn_dsac_ch_max_step_max",
-    "attn_dsac_ch_top3_step_mean",
-    "attn_dsac_ch_top3_step_median",
-    "attn_dsac_ch_top3_step_max",
-    "attn_dsac_ch_top3_step_top2mean",
+    "attn_dsac_ch_top3_head_mean_step_median",
+    "attn_dsac_ch_top3_head_mean_step_mean",
+    "attn_dsac_ch_top3_head_mean_step_max",
+    "attn_dsac_ch_top3_head_max_step_median",
+    "attn_dsac_ch_top3_head_max_step_mean",
+    "attn_dsac_ch_top3_head_max_step_max",
 ]
 CALIBRATION_SCORE_NAMES = ["final_recon_score"] + ATTN_DSAC_METHODS
+
+
+def build_training_loader(base_dataset, batch_size, split, seed, shuffle):
+    train_path, test_path, _ = data_paths(base_dataset)
+    ensure_paths_exist([train_path, test_path])
+    train_data = TrainData(train_path, test_path, split=split)
+    generator = torch.Generator().manual_seed(int(seed))
+    kwargs = {"batch_size": batch_size, "shuffle": bool(shuffle)}
+    if shuffle:
+        kwargs["generator"] = generator
+    print(
+        f"[ATTN-DSAC] full training loader from {base_dataset}: "
+        f"train_windows={len(train_data)}, shuffle={bool(shuffle)}, seed={seed}"
+    )
+    return DataLoader(train_data, **kwargs)
 
 
 def default_prototype_path(output_root, base_dataset, selected_steps, seed, save_id):
@@ -68,14 +81,15 @@ def check_captured_steps(attention_by_step, selected_steps):
 
 
 def attention_to_descriptor(attention, top_r, eps, print_debug=False, step=None):
-    # Expected shape after model capture: [B,L,K,K].
-    # If a future capture keeps source/head dim [B,L,A,K,K], average it here.
-    if attention.dim() == 5:
-        attention = attention.mean(dim=2)
-    if attention.dim() != 4:
-        raise ValueError(f"attention must have shape [B,L,K,K], got {list(attention.shape)}")
+    # Expected shape after model capture: [B,L,A,K,K], where A keeps
+    # residual-block/encoder-layer/head attention sources. Older cached inputs
+    # with shape [B,L,K,K] are treated as A=1.
+    if attention.dim() == 4:
+        attention = attention.unsqueeze(2)
+    if attention.dim() != 5:
+        raise ValueError(f"attention must have shape [B,L,A,K,K], got {list(attention.shape)}")
     if print_debug:
-        print(f"[ATTN-DSAC] step={step} real feature attention shape [B,L,K,K]: {list(attention.shape)}")
+        print(f"[ATTN-DSAC] step={step} real feature attention shape [B,L,A,K,K]: {list(attention.shape)}")
 
     affinity = attention.float()
     row_sum = affinity.sum(dim=-1, keepdim=True)
@@ -98,7 +112,7 @@ def attention_to_descriptor(attention, top_r, eps, print_debug=False, step=None)
         dim=-1,
     )
     if print_debug:
-        print(f"[ATTN-DSAC] step={step} phi shape [B,L,K,K+3]: {list(phi.shape)}")
+        print(f"[ATTN-DSAC] step={step} phi shape [B,L,A,K,K+3]: {list(phi.shape)}")
     return phi
 
 
@@ -121,16 +135,19 @@ def collect_attention_by_step(model, batch, selected_steps):
     return collect_pathb_result(model, batch, selected_steps)["feature_attention_by_step"]
 
 
-def compute_descriptor_stats(model, loader, selected_steps, args):
-    sum_by_step = {}
-    sumsq_by_step = {}
-    count_by_step = {}
+def compute_descriptor_ema_stats(model, loader, selected_steps, args):
+    mu_by_step = {}
+    second_by_step = {}
+    update_count_by_step = {}
+    sample_count_by_step = {}
+    a_dim = None
     k_dim = None
     d_phi = None
     printed = False
+    beta = float(args.ema_beta)
 
     with torch.no_grad():
-        with tqdm(loader, desc="ATTN-DSAC prototype pass1 stats", mininterval=5.0, maxinterval=50.0) as it:
+        with tqdm(loader, desc="ATTN-DSAC prototype pass1 EMA stats", mininterval=5.0, maxinterval=50.0) as it:
             for batch in it:
                 attention_by_step = collect_attention_by_step(model, batch, selected_steps)
                 for step in selected_steps:
@@ -143,35 +160,85 @@ def compute_descriptor_stats(model, loader, selected_steps, args):
                         step=step,
                     )
                     printed = True
-                    _, _, channels, feature_dim = phi.shape
+                    _, _, attention_sources, channels, feature_dim = phi.shape
+                    if a_dim is None:
+                        a_dim = int(attention_sources)
                     if k_dim is None:
                         k_dim = int(channels)
                         d_phi = int(feature_dim)
-                    phi_flat = phi.reshape(-1, channels, feature_dim).detach().cpu().double()
-                    if step not in sum_by_step:
-                        sum_by_step[step] = torch.zeros(channels, feature_dim, dtype=torch.float64)
-                        sumsq_by_step[step] = torch.zeros(channels, feature_dim, dtype=torch.float64)
-                        count_by_step[step] = 0
-                    sum_by_step[step] += phi_flat.sum(dim=0)
-                    sumsq_by_step[step] += (phi_flat * phi_flat).sum(dim=0)
-                    count_by_step[step] += int(phi_flat.shape[0])
+                    phi_flat = phi.reshape(-1, attention_sources, channels, feature_dim).detach().cpu().double()
+                    batch_mu = phi_flat.mean(dim=0)
+                    batch_second = (phi_flat * phi_flat).mean(dim=0)
+                    if step not in mu_by_step:
+                        mu_by_step[step] = batch_mu
+                        second_by_step[step] = batch_second
+                        update_count_by_step[step] = 1
+                        sample_count_by_step[step] = int(phi_flat.shape[0])
+                    else:
+                        mu_by_step[step] = beta * mu_by_step[step] + (1.0 - beta) * batch_mu
+                        second_by_step[step] = beta * second_by_step[step] + (1.0 - beta) * batch_second
+                        update_count_by_step[step] += 1
+                        sample_count_by_step[step] += int(phi_flat.shape[0])
 
     mu = []
     var = []
     for step in selected_steps:
         step = int(step)
-        if count_by_step.get(step, 0) == 0:
-            raise ValueError(f"no validation descriptors collected for step {step}")
-        count = float(count_by_step[step])
-        step_mu = sum_by_step[step] / count
-        step_var = torch.clamp((sumsq_by_step[step] / count) - (step_mu * step_mu), min=0.0)
+        if update_count_by_step.get(step, 0) == 0:
+            raise ValueError(f"no training descriptors collected for step {step}")
+        step_mu = mu_by_step[step]
+        step_var = torch.clamp(second_by_step[step] - (step_mu * step_mu), min=0.0)
         mu.append(step_mu.float())
         var.append(step_var.float())
+        print(
+            f"[ATTN-DSAC] EMA step={step}: updates={update_count_by_step[step]}, "
+            f"descriptor_samples={sample_count_by_step[step]}"
+        )
     mu = torch.stack(mu, dim=0)
     var = torch.stack(var, dim=0)
-    print(f"[ATTN-DSAC] mu shape [S,K,D_phi]: {list(mu.shape)}")
-    print(f"[ATTN-DSAC] var shape [S,K,D_phi]: {list(var.shape)}")
-    return mu, var, int(k_dim), int(d_phi)
+    print(f"[ATTN-DSAC] mu shape [S,A,K,D_phi]: {list(mu.shape)}")
+    print(f"[ATTN-DSAC] var shape [S,A,K,D_phi]: {list(var.shape)}")
+    return mu, var, int(a_dim), int(k_dim), int(d_phi)
+
+
+def descriptor_mahalanobis(phi, mu_step, var_step, ridge):
+    if phi.dim() == 4:
+        diff = phi - mu_step.reshape(1, 1, mu_step.shape[0], mu_step.shape[1]).to(phi.device, phi.dtype)
+        denom = var_step.reshape(1, 1, var_step.shape[0], var_step.shape[1]).to(phi.device, phi.dtype) + float(ridge)
+        return torch.sqrt(torch.clamp(torch.sum((diff * diff) / denom, dim=-1), min=0.0))
+    if phi.dim() != 5:
+        raise ValueError(f"phi must have shape [B,L,A,K,D_phi], got {list(phi.shape)}")
+    diff = phi - mu_step.reshape(1, 1, mu_step.shape[0], mu_step.shape[1], mu_step.shape[2]).to(phi.device, phi.dtype)
+    denom = var_step.reshape(1, 1, var_step.shape[0], var_step.shape[1], var_step.shape[2]).to(phi.device, phi.dtype) + float(ridge)
+    return torch.sqrt(torch.clamp(torch.sum((diff * diff) / denom, dim=-1), min=0.0))
+
+
+def empirical_cdf_scores(dist, sorted_dist):
+    dist_cpu = dist.detach().cpu().float().numpy()
+    if torch.is_tensor(sorted_dist):
+        sorted_dist_np = sorted_dist.detach().cpu().float().numpy()
+    else:
+        sorted_dist_np = np.asarray(sorted_dist, dtype=np.float32)
+
+    if dist_cpu.ndim == 3:
+        q = np.empty_like(dist_cpu, dtype=np.float32)
+        for channel in range(dist_cpu.shape[-1]):
+            flat = dist_cpu[..., channel].reshape(-1)
+            reference = sorted_dist_np[channel]
+            rank = np.searchsorted(reference, flat, side="right")
+            q[..., channel] = (rank.astype(np.float32) / float(len(reference))).reshape(dist_cpu.shape[0], dist_cpu.shape[1])
+        return torch.from_numpy(q)
+
+    if dist_cpu.ndim != 4:
+        raise ValueError(f"dist must have shape [B,L,A,K], got {list(dist.shape)}")
+    q = np.empty_like(dist_cpu, dtype=np.float32)
+    for source in range(dist_cpu.shape[2]):
+        for channel in range(dist_cpu.shape[3]):
+            flat = dist_cpu[:, :, source, channel].reshape(-1)
+            reference = sorted_dist_np[source, channel]
+            rank = np.searchsorted(reference, flat, side="right")
+            q[:, :, source, channel] = (rank.astype(np.float32) / float(len(reference))).reshape(dist_cpu.shape[0], dist_cpu.shape[1])
+    return torch.from_numpy(q)
 
 
 def collect_validation_distances(model, loader, selected_steps, args, mu, var):
@@ -179,7 +246,7 @@ def collect_validation_distances(model, loader, selected_steps, args, mu, var):
     printed = False
 
     with torch.no_grad():
-        with tqdm(loader, desc="ATTN-DSAC prototype pass2 val distances", mininterval=5.0, maxinterval=50.0) as it:
+        with tqdm(loader, desc="ATTN-DSAC prototype pass2 train CDF distances", mininterval=5.0, maxinterval=50.0) as it:
             for batch in it:
                 attention_by_step = collect_attention_by_step(model, batch, selected_steps)
                 for step_index, step in enumerate(selected_steps):
@@ -193,49 +260,59 @@ def collect_validation_distances(model, loader, selected_steps, args, mu, var):
                     )
                     dist = descriptor_mahalanobis(phi, mu[step_index], var[step_index], args.ridge)
                     if not printed:
-                        print(f"[ATTN-DSAC] validation distance shape [B,L,K]: {list(dist.shape)}")
+                        print(f"[ATTN-DSAC] train distance shape [B,L,A,K]: {list(dist.shape)}")
                         printed = True
-                    distances_by_step[step].append(dist.reshape(-1, dist.shape[-1]).detach().cpu().float())
+                    distances_by_step[step].append(dist.reshape(-1, dist.shape[-2], dist.shape[-1]).detach().cpu().float())
 
     sorted_steps = []
     for step in selected_steps:
         step = int(step)
         dist = torch.cat(distances_by_step[step], dim=0)
-        sorted_dist = torch.sort(dist, dim=0).values.transpose(0, 1).contiguous()
-        print(f"[ATTN-DSAC] val_dist_sorted step={step} shape [K,N]: {list(sorted_dist.shape)}")
+        sorted_dist = torch.sort(dist, dim=0).values.permute(1, 2, 0).contiguous()
+        print(f"[ATTN-DSAC] val_dist_sorted step={step} shape [A,K,N]: {list(sorted_dist.shape)}")
         sorted_steps.append(sorted_dist)
     return torch.stack(sorted_steps, dim=0)
 
 
-def channel_aggregate(q, topk):
+def channel_top3_aggregate(q, topk):
+    if q.dim() != 4:
+        raise ValueError(f"q must be [B,L,A,K], got {list(q.shape)}")
+    k = min(int(topk), q.shape[-1])
+    return q.topk(k=k, dim=-1).values.mean(dim=-1)
+
+
+def head_aggregate(values):
+    if values.dim() != 3:
+        raise ValueError(f"head input must be [B,L,A], got {list(values.shape)}")
     return {
-        "ch_mean": q.mean(dim=-1),
-        "ch_max": q.max(dim=-1).values,
-        "ch_top3": q.topk(k=min(int(topk), q.shape[-1]), dim=-1).values.mean(dim=-1),
+        "head_mean": values.mean(dim=-1),
+        "head_max": values.max(dim=-1).values,
     }
 
 
-def step_top2mean(values):
-    k = min(2, values.shape[0])
-    return values.topk(k=k, dim=0).values.mean(dim=0)
+def step_aggregate(values):
+    if values.dim() != 3:
+        raise ValueError(f"step input must be [S,B,L], got {list(values.shape)}")
+    return {
+        "step_median": values.median(dim=0).values,
+        "step_mean": values.mean(dim=0),
+        "step_max": values.max(dim=0).values,
+    }
 
 
 def aggregate_q_by_method(q_by_step, selected_steps, topk):
-    channel_step_scores = {}
+    head_step_scores = {"head_mean": [], "head_max": []}
     for step in selected_steps:
-        channel_step_scores[int(step)] = channel_aggregate(q_by_step[int(step)], topk)
+        ch_top3 = channel_top3_aggregate(q_by_step[int(step)], topk)
+        per_head = head_aggregate(ch_top3)
+        for head_name, score in per_head.items():
+            head_step_scores[head_name].append(score)
 
     methods = {}
-    for channel_name in ["ch_mean", "ch_max", "ch_top3"]:
-        stack = torch.stack(
-            [channel_step_scores[int(step)][channel_name] for step in selected_steps],
-            dim=0,
-        )
-        methods[f"attn_dsac_{channel_name}_step_mean"] = stack.mean(dim=0)
-        methods[f"attn_dsac_{channel_name}_step_median"] = stack.median(dim=0).values
-        methods[f"attn_dsac_{channel_name}_step_max"] = stack.max(dim=0).values
-        if channel_name == "ch_top3":
-            methods[f"attn_dsac_{channel_name}_step_top2mean"] = step_top2mean(stack)
+    for head_name, step_scores in head_step_scores.items():
+        stack = torch.stack(step_scores, dim=0)
+        for step_name, score in step_aggregate(stack).items():
+            methods[f"attn_dsac_ch_top3_{head_name}_{step_name}"] = score
     return {name: methods[name] for name in ATTN_DSAC_METHODS}
 
 
@@ -257,7 +334,7 @@ def compute_attn_dsac_window_methods(attention_by_step, selected_steps, mu, var,
         q_by_step[step] = q
         if print_debug:
             print(
-                f"[ATTN-DSAC] step={step} q shape [num_windows,L,K]: {list(q.shape)} "
+                f"[ATTN-DSAC] step={step} q shape [num_windows,L,A,K]: {list(q.shape)} "
                 f"min/max={float(q.min())}/{float(q.max())}"
             )
     return aggregate_q_by_method(q_by_step, selected_steps, topk)
@@ -323,12 +400,24 @@ def run_build_prototype(args, save_id, selected_steps):
     print("[ATTN-DSAC] mode=build_prototype")
     print(f"[ATTN-DSAC] base_dataset={args.base_dataset}; model_dataset={args.model_dataset}; save={save_id}")
 
-    validation_loader_1 = build_validation_loader(args.base_dataset, args.batch_size, args.split, args.val_ratio, args.seed)
-    validation_loader_2 = build_validation_loader(args.base_dataset, args.batch_size, args.split, args.val_ratio, args.seed)
+    prototype_loader = build_training_loader(
+        args.base_dataset,
+        args.batch_size,
+        args.split,
+        args.seed,
+        shuffle=True,
+    )
+    cdf_loader = build_training_loader(
+        args.base_dataset,
+        args.batch_size,
+        args.split,
+        args.seed,
+        shuffle=False,
+    )
     calibration_loader = build_validation_loader(args.base_dataset, args.batch_size, args.split, args.val_ratio, args.seed)
     model, subset_name, model_diffusion_step = load_model_for_save(args, save_id)
-    mu, var, k_dim, d_phi = compute_descriptor_stats(model, validation_loader_1, selected_steps, args)
-    val_dist_sorted = collect_validation_distances(model, validation_loader_2, selected_steps, args, mu, var)
+    mu, var, a_dim, k_dim, d_phi = compute_descriptor_ema_stats(model, prototype_loader, selected_steps, args)
+    val_dist_sorted = collect_validation_distances(model, cdf_loader, selected_steps, args, mu, var)
     calibration_payload = collect_calibration_norm_stats(
         model,
         calibration_loader,
@@ -348,10 +437,12 @@ def run_build_prototype(args, save_id, selected_steps):
         mu=mu.numpy().astype(np.float32),
         var=var.numpy().astype(np.float32),
         val_dist_sorted=val_dist_sorted.numpy().astype(np.float32),
+        A=np.asarray(a_dim, dtype=np.int64),
         C=np.asarray(k_dim, dtype=np.int64),
         D_phi=np.asarray(d_phi, dtype=np.int64),
         ridge=np.asarray(float(args.ridge), dtype=np.float32),
         eps=np.asarray(float(args.eps), dtype=np.float32),
+        ema_beta=np.asarray(float(args.ema_beta), dtype=np.float32),
         top_r_descriptor=np.asarray(int(args.top_r_descriptor), dtype=np.int64),
         val_ratio=np.asarray(float(args.val_ratio), dtype=np.float32),
         seed=np.asarray(int(args.seed), dtype=np.int64),
@@ -360,8 +451,14 @@ def run_build_prototype(args, save_id, selected_steps):
         model_dataset=np.asarray(args.model_dataset),
         model_subset_name=np.asarray(subset_name),
         model_diffusion_step=np.asarray(int(model_diffusion_step), dtype=np.int64),
-        score_type=np.asarray("real_feature_attention_dsac_validation_prototype"),
-        attention_source=np.asarray("feature_layer_true_attention_mean_over_blocks_heads"),
+        score_type=np.asarray("real_feature_attention_dsac_train_ema_prototype"),
+        attention_source=np.asarray("feature_layer_true_attention_per_source_no_average"),
+        prototype_source=np.asarray("full_training_set_ema"),
+        prototype_shape=np.asarray("[S,A,K,D_phi]"),
+        prototype_update_rule=np.asarray("EMA first and second moments over full normal training batches; var=E[x^2]-E[x]^2"),
+        cdf_source=np.asarray("full_training_set_distances_with_fixed_ema_mu_var"),
+        cdf_shape=np.asarray("[S,A,K,N]"),
+        calibration_source=np.asarray("train_5_percent_validation_split"),
         **calibration_payload,
     )
     print(f"[ATTN-DSAC] saved prototype: {prototype_path}")
@@ -408,7 +505,7 @@ def run_score(args, save_id, selected_steps):
     calibration_stats = load_calibration_stats_from_prototype(prototype)
     print(f"[ATTN-DSAC] loaded prototype mu shape: {list(mu.shape)}")
     print(f"[ATTN-DSAC] loaded prototype var shape: {list(var.shape)}")
-    print(f"[ATTN-DSAC] loaded prototype val_dist_sorted shape [S,K,N]: {list(val_dist_sorted.shape)}")
+    print(f"[ATTN-DSAC] loaded prototype val_dist_sorted shape [S,A,K,N]: {list(val_dist_sorted.shape)}")
 
     labels = load_labels(args.dataset)
     label_sum = check_dataset_label_sum(args.dataset, labels)
@@ -562,6 +659,7 @@ def main():
     parser.add_argument("--split", type=int, default=4)
     parser.add_argument("--ridge", type=float, default=1e-4)
     parser.add_argument("--eps", type=float, default=1e-8)
+    parser.add_argument("--ema_beta", type=float, default=0.99)
     parser.add_argument("--top_r_descriptor", type=int, default=3)
     parser.add_argument("--channel_topk", type=int, default=3)
     parser.add_argument("--fusion_alpha", type=float, default=0.5)
