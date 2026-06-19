@@ -189,6 +189,187 @@ class CSDI_base(nn.Module):
 
         return reconstructed_samples
 
+    def resolve_diffpath_timesteps(self, num_path_steps=10):
+        num_path_steps = int(num_path_steps)
+        if num_path_steps < 2:
+            raise ValueError("DiffPath requires at least two path steps")
+        if num_path_steps > self.num_steps:
+            raise ValueError(
+                f"DiffPath path steps {num_path_steps} exceed diffusion steps {self.num_steps}"
+            )
+
+        # Match DiffPath's "ddimN" respacing: use the first integer stride
+        # that produces exactly N retained diffusion steps.
+        for stride in range(1, self.num_steps):
+            timesteps = list(range(0, self.num_steps, stride))
+            if len(timesteps) == num_path_steps:
+                return timesteps
+        raise ValueError(
+            f"cannot create exactly {num_path_steps} DDIM steps from "
+            f"{self.num_steps} diffusion steps with an integer stride"
+        )
+
+    def compute_diffpath_1d(
+        self,
+        observed_data,
+        cond_mask,
+        side_info,
+        strategy_type,
+        num_path_steps=10,
+        return_moments=False,
+    ):
+        """Compute the deterministic DiffPath statistic for each time point."""
+        B, _, L = observed_data.shape
+        timesteps = self.resolve_diffpath_timesteps(num_path_steps)
+        current_sample = observed_data
+        previous_epsilon = None
+        derivative_sq_sum = torch.zeros(
+            B,
+            L,
+            device=observed_data.device,
+            dtype=observed_data.dtype,
+        )
+        epsilon_moment_sums = None
+        derivative_moment_sums = None
+        if return_moments:
+            epsilon_moment_sums = torch.zeros(
+                B,
+                3,
+                L,
+                device=observed_data.device,
+                dtype=observed_data.dtype,
+            )
+            derivative_moment_sums = torch.zeros_like(
+                epsilon_moment_sums
+            )
+        path_scale = float(len(timesteps))
+
+        for step_index, t in enumerate(timesteps):
+            diffusion_step = torch.full(
+                (B,),
+                int(t),
+                device=self.device,
+                dtype=torch.long,
+            )
+            diff_input = self.set_input_to_diffmodel(
+                current_sample,
+                observed_data,
+                cond_mask,
+            )
+            epsilon = self.diffmodel(
+                diff_input,
+                side_info,
+                diffusion_step,
+                strategy_type,
+            )
+
+            if return_moments:
+                epsilon_moment_sums += torch.stack(
+                    [
+                        epsilon.sum(dim=1),
+                        (epsilon ** 2).sum(dim=1),
+                        (epsilon ** 3).sum(dim=1),
+                    ],
+                    dim=1,
+                )
+
+            if previous_epsilon is not None:
+                derivative = (epsilon - previous_epsilon) * path_scale
+                derivative_sq_sum += (derivative ** 2).sum(dim=1)
+                if return_moments:
+                    derivative_moment_sums += torch.stack(
+                        [
+                            derivative.sum(dim=1),
+                            (derivative ** 2).sum(dim=1),
+                            (derivative ** 3).sum(dim=1),
+                        ],
+                        dim=1,
+                    )
+            previous_epsilon = epsilon
+
+            if step_index + 1 < len(timesteps):
+                next_t = timesteps[step_index + 1]
+                alpha_t = self.alpha_torch[t]
+                alpha_next = self.alpha_torch[next_t]
+                predicted_x0 = (
+                    current_sample - (1.0 - alpha_t) ** 0.5 * epsilon
+                ) / (alpha_t ** 0.5)
+                current_sample = (
+                    alpha_next ** 0.5 * predicted_x0
+                    + (1.0 - alpha_next) ** 0.5 * epsilon
+                )
+
+        result = {
+            "diffpath_1d_statistic": torch.sqrt(
+                torch.clamp(derivative_sq_sum, min=0.0)
+            ),
+            "diffpath_timesteps": timesteps,
+            "diffpath_path_scale": path_scale,
+        }
+        if return_moments:
+            result["epsilon_moment_sums"] = epsilon_moment_sums
+            result["derivative_moment_sums"] = derivative_moment_sums
+            result["diffpath_6d_moment_sums"] = torch.cat(
+                [epsilon_moment_sums, derivative_moment_sums],
+                dim=1,
+            )
+        return result
+
+    def diffpath_evaluate(
+        self,
+        batch,
+        n_samples=1,
+        num_path_steps=10,
+        return_moments=False,
+    ):
+        (
+            observed_data,
+            observed_mask,
+            observed_tp,
+            _gt_mask,
+            _for_pattern_mask,
+            cut_length,
+            strategy_type,
+        ) = self.process_data(batch)
+
+        if self.task_mode != "reconstruction":
+            raise RuntimeError(
+                "DiffPath is implemented for reconstruction checkpoints only"
+            )
+
+        with torch.no_grad():
+            cond_mask = torch.zeros_like(observed_mask)
+            strategy_type = torch.zeros_like(strategy_type)
+            eval_points = observed_mask.clone()
+            side_info = self.get_side_info(observed_tp, cond_mask)
+            samples = self.reconstruct(
+                observed_data,
+                cond_mask,
+                side_info,
+                n_samples,
+                strategy_type,
+            )
+            diffpath_result = self.compute_diffpath_1d(
+                observed_data,
+                cond_mask,
+                side_info,
+                strategy_type,
+                num_path_steps=num_path_steps,
+                return_moments=return_moments,
+            )
+
+            for i in range(len(cut_length)):
+                eval_points[i, ..., 0 : cut_length[i].item()] = 0
+
+        return (
+            samples,
+            observed_data,
+            eval_points,
+            observed_mask,
+            observed_tp,
+            diffpath_result,
+        )
+
     def resolve_pathB_compare_steps(self, pathB_mid_step=None, pathB_compare_steps=None, include_zero=False):
         last_step = self.num_steps - 1
         if pathB_compare_steps is None:
@@ -333,9 +514,10 @@ class CSDI_base(nn.Module):
                         if hidden is not None:
                             h_compare[t] = hidden.detach()
                         if feature_attn is not None:
-                            # Average residual-block/head attention sources to keep the
-                            # returned topology compact: [B,L,A,K,K] -> [B,L,K,K].
-                            attention_compare[t] = feature_attn.detach().mean(dim=2).cpu()
+                            # Keep per-source spatial attention for DSAC-style analysis.
+                            # Shape: [B,L,A,K,K], where A flattens residual block,
+                            # encoder layer, and attention head sources.
+                            attention_compare[t] = feature_attn.detach().cpu()
                     if t == 0:
                         if hidden is not None:
                             h_final = hidden.detach()
@@ -379,6 +561,16 @@ class CSDI_base(nn.Module):
                 pathB_result["feature_attention_by_step"] = {
                     int(step): attention_compare[step]
                     for step in compare_steps
+                }
+                first_attention = next(iter(attention_compare.values()))
+                pathB_result["feature_attention_metadata"] = {
+                    "attention_axis": "feature/spatial",
+                    "attention_shape": "[B,L,A,K,K]",
+                    "attention_unit": "residual_block_encoder_layer_head",
+                    "attention_source_count": int(first_attention.shape[2]),
+                    "feature_count": int(first_attention.shape[-1]),
+                    "temporal_attention_captured": False,
+                    "averaged_over_attention_sources": False,
                 }
             for step in compare_steps:
                 if compute_self_scores and step != 0:

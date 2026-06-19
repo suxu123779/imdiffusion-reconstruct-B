@@ -203,11 +203,11 @@ def train(
         1
     ]
     # RECON_CHANGE: best checkpoint 指标需要跟随当前 task_mode，不能再固定理解为插补 RMSE。
-    best_validation_score = 10000
+    best_validation_score = float("inf")
     stop_counter = 0
-    # for epoch_no in range(config["epochs"]):
-    # !for test!
-    for epoch_no in range(0,500):
+    # Keep the original training protocol: 500 is only a safety cap.
+    # Validation-based early stopping normally ends training much sooner.
+    for epoch_no in range(500):
 
         avg_loss = 0
         model.train()

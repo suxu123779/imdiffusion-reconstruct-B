@@ -7,6 +7,11 @@ import os
 
 from main_model import CSDI_Physio
 from dataset import get_dataloader
+from diffpath_1d import (
+    build_normal_loader,
+    run_diffpath_pathb,
+    seed_for_save,
+)
 from utils import (
     train,
     window_trick_evaluate_middle,
@@ -40,9 +45,22 @@ parser.add_argument("--result_tag", type=str, default="")
 parser.add_argument("--overwrite", action="store_true")
 parser.add_argument("--pathB_mid_step", type=int, default=None)
 parser.add_argument("--pathB_compare_steps", type=str, default="49,45,40,35,30,25,20,15,10,5,0")
-parser.add_argument("--pathB_mode", choices=["self", "proto", "both"], default="self")
+parser.add_argument("--pathB_mode", choices=["self", "proto", "both", "diffpath"], default="self")
 parser.add_argument("--pathB_proto_dataset", type=str, default="")
 parser.add_argument("--pathB_proto_recompute", action="store_true")
+parser.add_argument("--saves", nargs="+", default=None)
+parser.add_argument("--diffpath_num_steps", type=int, default=10)
+parser.add_argument(
+    "--diffpath_kde_bandwidths",
+    type=str,
+    default="0.05,0.1,0.2,0.5,1.0",
+)
+parser.add_argument(
+    "--diffpath_6d_kde_bandwidths",
+    type=str,
+    default="0.2,0.5,1.0,2.0,5.0",
+)
+parser.add_argument("--diffpath_recompute_calibrator", action="store_true")
 args = parser.parse_args()
 result_tag = args.result_tag or args.dataset
 model_dataset = args.model_dataset or args.dataset
@@ -73,7 +91,10 @@ if not os.path.isdir("train_result"):
 
 matched_model_count = 0
 available_model_dirs = []
-for iteration in os.listdir("train_result"):
+requested_saves = set(args.saves) if args.saves else None
+for iteration in sorted(os.listdir("train_result")):
+    if requested_saves is not None and iteration not in requested_saves:
+        continue
 
     try:
         os.mkdir(f"window_result/{iteration}")
@@ -159,7 +180,7 @@ for iteration in os.listdir("train_result"):
 
         task_mode = run_config["model"].get("task_mode", "imputation")
 
-        if args.dataset == "SMD":
+        if args.dataset == "SMD" or args.dataset.startswith("machine-"):
             feature_dim = 38
         elif args.dataset == "PSM":
             feature_dim = 25
@@ -201,6 +222,42 @@ for iteration in os.listdir("train_result"):
 
         for temp_i in range(0,1):
             if task_mode == "reconstruction":
+                if args.pathB_mode == "diffpath":
+                    diffpath_seed = seed_for_save(args.seed, iteration)
+                    normal_train_path = (
+                        f"data/Machine/{pathB_proto_dataset}_train.pkl"
+                    )
+                    if not os.path.exists(normal_train_path):
+                        raise FileNotFoundError(
+                            "DiffPath normal training data not found: "
+                            f"{normal_train_path}"
+                        )
+                    normal_loader = build_normal_loader(
+                        normal_train_path,
+                        batch_size=24,
+                        split=split,
+                    )
+                    run_diffpath_pathb(
+                        model,
+                        normal_loader,
+                        train_error_loader_list,
+                        label_data_path,
+                        output_root=args.pathB_output_root,
+                        result_tag=result_tag,
+                        base_dataset=pathB_proto_dataset,
+                        save_id=iteration,
+                        num_path_steps=args.diffpath_num_steps,
+                        split=split,
+                        seed=diffpath_seed,
+                        bandwidths=args.diffpath_kde_bandwidths,
+                        bandwidths_6d=args.diffpath_6d_kde_bandwidths,
+                        recompute_calibrator=(
+                            args.diffpath_recompute_calibrator
+                        ),
+                        overwrite=args.overwrite,
+                    )
+                    continue
+
                 threshold_filename = f"{0}-generated_outputs_nsample1{str(temp_i)}_stop_number_-1_threshold.json"
                 ensure_outputs_can_be_written(
                     [
