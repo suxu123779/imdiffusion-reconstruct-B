@@ -10,10 +10,20 @@ import torch
 
 METHOD_ORDER = (
     "final_reconstruction",
+    "final_reconstruction_sum_abs",
+    "final_reconstruction_max_abs",
     "diffpath_1d",
     "diffpath_6d",
+    "diffpath_6d_gmm",
     "fused_reconstruction_diffpath_1d",
+    "fused_sum_abs_reconstruction_diffpath_1d",
+    "fused_max_abs_reconstruction_diffpath_1d",
     "fused_reconstruction_diffpath_6d",
+    "fused_sum_abs_reconstruction_diffpath_6d",
+    "fused_max_abs_reconstruction_diffpath_6d",
+    "fused_reconstruction_diffpath_6d_gmm",
+    "fused_sum_abs_reconstruction_diffpath_6d_gmm",
+    "fused_max_abs_reconstruction_diffpath_6d_gmm",
 )
 
 
@@ -240,6 +250,8 @@ def load_score_file(path):
     required = [
         "labels_aligned",
         "valid_indices",
+        "final_recon_score",
+        "diffpath_1d_raw_score",
         "recon_cdf",
         "diffpath_1d_cdf",
     ]
@@ -251,41 +263,125 @@ def load_score_file(path):
     valid_indices = payload["valid_indices"].astype(
         np.int64
     ).reshape(-1)
-    recon_cdf = payload["recon_cdf"].astype(np.float64).reshape(-1)
+    recon_sum_raw = payload.get(
+        "final_recon_score_sum_abs",
+        payload["final_recon_score"],
+    ).astype(
+        np.float64
+    ).reshape(-1)
+    recon_max_raw = None
+    if "final_recon_score_max_abs" in payload:
+        recon_max_raw = payload["final_recon_score_max_abs"].astype(
+            np.float64
+        ).reshape(-1)
+    diffpath_raw = payload["diffpath_1d_raw_score"].astype(
+        np.float64
+    ).reshape(-1)
+    recon_sum_cdf = payload.get(
+        "recon_sum_abs_cdf",
+        payload["recon_cdf"],
+    ).astype(np.float64).reshape(-1)
+    recon_max_cdf = None
+    if "recon_max_abs_cdf" in payload:
+        recon_max_cdf = payload["recon_max_abs_cdf"].astype(
+            np.float64
+        ).reshape(-1)
+    if (recon_max_raw is None) != (recon_max_cdf is None):
+        raise ValueError(
+            f"{path} must contain both raw and CDF max-abs reconstruction scores"
+        )
     diffpath_cdf = payload["diffpath_1d_cdf"].astype(
         np.float64
     ).reshape(-1)
+    diffpath_6d_raw = None
+    if "diffpath_6d_kde_raw_score" in payload:
+        diffpath_6d_raw = payload["diffpath_6d_kde_raw_score"].astype(
+            np.float64
+        ).reshape(-1)
+    elif "diffpath_6d_raw_score" in payload:
+        diffpath_6d_raw = payload["diffpath_6d_raw_score"].astype(
+            np.float64
+        ).reshape(-1)
     diffpath_6d_cdf = None
-    if "diffpath_6d_cdf" in payload:
+    if "diffpath_6d_kde_cdf" in payload:
+        diffpath_6d_cdf = payload["diffpath_6d_kde_cdf"].astype(
+            np.float64
+        ).reshape(-1)
+    elif "diffpath_6d_cdf" in payload:
         diffpath_6d_cdf = payload["diffpath_6d_cdf"].astype(
             np.float64
         ).reshape(-1)
-    if (
-        len(labels) != len(valid_indices)
-        or len(labels) != len(recon_cdf)
-        or len(labels) != len(diffpath_cdf)
-        or (
-            diffpath_6d_cdf is not None
-            and len(labels) != len(diffpath_6d_cdf)
-        )
-    ):
+    if (diffpath_6d_raw is None) != (diffpath_6d_cdf is None):
         raise ValueError(
-            f"{path} aligned lengths differ: labels={len(labels)}, "
-            f"indices={len(valid_indices)}, "
-            f"recon={len(recon_cdf)}, diffpath={len(diffpath_cdf)}, "
-            f"diffpath_6d={len(diffpath_6d_cdf) if diffpath_6d_cdf is not None else 'missing'}"
+            f"{path} must contain both raw and CDF DiffPath-6D KDE scores"
         )
+    diffpath_6d_gmm_raw = None
+    if "diffpath_6d_gmm_raw_score" in payload:
+        diffpath_6d_gmm_raw = payload[
+            "diffpath_6d_gmm_raw_score"
+        ].astype(np.float64).reshape(-1)
+    diffpath_6d_gmm_cdf = None
+    if "diffpath_6d_gmm_cdf" in payload:
+        diffpath_6d_gmm_cdf = payload["diffpath_6d_gmm_cdf"].astype(
+            np.float64
+        ).reshape(-1)
+    if (diffpath_6d_gmm_raw is None) != (diffpath_6d_gmm_cdf is None):
+        raise ValueError(
+            f"{path} must contain both raw and CDF DiffPath-6D-GMM scores"
+        )
+    score_lengths = {
+        "labels": labels,
+        "valid_indices": valid_indices,
+        "final_recon_score": recon_sum_raw,
+        "diffpath_1d_raw_score": diffpath_raw,
+        "recon_cdf": recon_sum_cdf,
+        "recon_sum_abs_cdf": recon_sum_cdf,
+        "diffpath_1d_cdf": diffpath_cdf,
+    }
+    if recon_max_raw is not None:
+        score_lengths["final_recon_score_max_abs"] = recon_max_raw
+        score_lengths["recon_max_abs_cdf"] = recon_max_cdf
+    if diffpath_6d_raw is not None:
+        score_lengths["diffpath_6d_raw_score"] = diffpath_6d_raw
+        score_lengths["diffpath_6d_cdf"] = diffpath_6d_cdf
+    if diffpath_6d_gmm_raw is not None:
+        score_lengths["diffpath_6d_gmm_raw_score"] = (
+            diffpath_6d_gmm_raw
+        )
+        score_lengths["diffpath_6d_gmm_cdf"] = diffpath_6d_gmm_cdf
+    bad_lengths = {
+        name: len(values)
+        for name, values in score_lengths.items()
+        if len(values) != len(labels)
+    }
+    if bad_lengths:
+        lengths = {
+            name: len(values)
+            for name, values in score_lengths.items()
+        }
+        raise ValueError(f"{path} aligned lengths differ: {lengths}")
     loaded = {
         "path": path,
         "payload": payload,
         "save": infer_save_id(path),
         "labels": labels,
         "valid_indices": valid_indices,
-        "recon_cdf": recon_cdf,
+        "recon_raw": recon_sum_raw,
+        "recon_sum_raw": recon_sum_raw,
+        "diffpath_raw": diffpath_raw,
+        "recon_cdf": recon_sum_cdf,
+        "recon_sum_cdf": recon_sum_cdf,
         "diffpath_cdf": diffpath_cdf,
     }
-    if diffpath_6d_cdf is not None:
+    if recon_max_raw is not None:
+        loaded["recon_max_raw"] = recon_max_raw
+        loaded["recon_max_cdf"] = recon_max_cdf
+    if diffpath_6d_raw is not None:
+        loaded["diffpath_6d_raw"] = diffpath_6d_raw
         loaded["diffpath_6d_cdf"] = diffpath_6d_cdf
+    if diffpath_6d_gmm_raw is not None:
+        loaded["diffpath_6d_gmm_raw"] = diffpath_6d_gmm_raw
+        loaded["diffpath_6d_gmm_cdf"] = diffpath_6d_gmm_cdf
     return loaded
 
 
@@ -470,57 +566,150 @@ def evaluate_dataset(root, dataset, alphas, saves=None):
                 f"{dataset}: repeated runs do not use identical aligned "
                 "test points and labels"
             )
-        recon_result = best_point_adjusted_threshold(
+        recon_sum_result = best_point_adjusted_threshold(
             labels,
-            loaded["recon_cdf"],
+            loaded["recon_sum_raw"],
         )
+        recon_max_result = None
+        if "recon_max_raw" in loaded:
+            recon_max_result = best_point_adjusted_threshold(
+                labels,
+                loaded["recon_max_raw"],
+            )
         diffpath_result = best_point_adjusted_threshold(
             labels,
-            loaded["diffpath_cdf"],
+            loaded["diffpath_raw"],
         )
-        fused_1d_result = best_fusion(
+        fused_1d_sum_result = best_fusion(
             labels,
-            loaded["recon_cdf"],
+            loaded["recon_sum_cdf"],
             loaded["diffpath_cdf"],
             alphas,
         )
         save_best_fusion(
             loaded,
             dataset,
-            fused_1d_result,
-            suffix="1d",
-            formula="alpha * recon_cdf + (1-alpha) * diffpath_1d_cdf",
+            fused_1d_sum_result,
+            suffix="sum_abs_1d",
+            formula=(
+                "alpha * recon_sum_abs_cdf + "
+                "(1-alpha) * diffpath_1d_cdf"
+            ),
         )
+        fused_1d_max_result = None
+        if "recon_max_cdf" in loaded:
+            fused_1d_max_result = best_fusion(
+                labels,
+                loaded["recon_max_cdf"],
+                loaded["diffpath_cdf"],
+                alphas,
+            )
+            save_best_fusion(
+                loaded,
+                dataset,
+                fused_1d_max_result,
+                suffix="max_abs_1d",
+                formula=(
+                    "alpha * recon_max_abs_cdf + "
+                    "(1-alpha) * diffpath_1d_cdf"
+                ),
+            )
         diffpath_6d_result = None
-        fused_6d_result = None
+        fused_6d_sum_result = None
+        fused_6d_max_result = None
         if "diffpath_6d_cdf" in loaded:
             diffpath_6d_result = best_point_adjusted_threshold(
                 labels,
-                loaded["diffpath_6d_cdf"],
+                loaded["diffpath_6d_raw"],
             )
-            fused_6d_result = best_fusion(
+            fused_6d_sum_result = best_fusion(
                 labels,
-                loaded["recon_cdf"],
+                loaded["recon_sum_cdf"],
                 loaded["diffpath_6d_cdf"],
                 alphas,
             )
             save_best_fusion(
                 loaded,
                 dataset,
-                fused_6d_result,
-                suffix="6d",
+                fused_6d_sum_result,
+                suffix="sum_abs_6d",
                 formula=(
-                    "alpha * recon_cdf + "
+                    "alpha * recon_sum_abs_cdf + "
                     "(1-alpha) * diffpath_6d_cdf"
                 ),
             )
+            if "recon_max_cdf" in loaded:
+                fused_6d_max_result = best_fusion(
+                    labels,
+                    loaded["recon_max_cdf"],
+                    loaded["diffpath_6d_cdf"],
+                    alphas,
+                )
+                save_best_fusion(
+                    loaded,
+                    dataset,
+                    fused_6d_max_result,
+                    suffix="max_abs_6d",
+                    formula=(
+                        "alpha * recon_max_abs_cdf + "
+                        "(1-alpha) * diffpath_6d_cdf"
+                    ),
+                )
+        diffpath_6d_gmm_result = None
+        fused_6d_gmm_sum_result = None
+        fused_6d_gmm_max_result = None
+        if "diffpath_6d_gmm_cdf" in loaded:
+            diffpath_6d_gmm_result = best_point_adjusted_threshold(
+                labels,
+                loaded["diffpath_6d_gmm_raw"],
+            )
+            fused_6d_gmm_sum_result = best_fusion(
+                labels,
+                loaded["recon_sum_cdf"],
+                loaded["diffpath_6d_gmm_cdf"],
+                alphas,
+            )
+            save_best_fusion(
+                loaded,
+                dataset,
+                fused_6d_gmm_sum_result,
+                suffix="sum_abs_6d_gmm",
+                formula=(
+                    "alpha * recon_sum_abs_cdf + "
+                    "(1-alpha) * diffpath_6d_gmm_cdf"
+                ),
+            )
+            if "recon_max_cdf" in loaded:
+                fused_6d_gmm_max_result = best_fusion(
+                    labels,
+                    loaded["recon_max_cdf"],
+                    loaded["diffpath_6d_gmm_cdf"],
+                    alphas,
+                )
+                save_best_fusion(
+                    loaded,
+                    dataset,
+                    fused_6d_gmm_max_result,
+                    suffix="max_abs_6d_gmm",
+                    formula=(
+                        "alpha * recon_max_abs_cdf + "
+                        "(1-alpha) * diffpath_6d_gmm_cdf"
+                    ),
+                )
 
         save_rows = [
             result_row(
                 dataset,
                 loaded["save"],
                 "final_reconstruction",
-                recon_result,
+                recon_sum_result,
+                labels.sum(),
+            ),
+            result_row(
+                dataset,
+                loaded["save"],
+                "final_reconstruction_sum_abs",
+                recon_sum_result,
                 labels.sum(),
             ),
             result_row(
@@ -534,10 +723,36 @@ def evaluate_dataset(root, dataset, alphas, saves=None):
                 dataset,
                 loaded["save"],
                 "fused_reconstruction_diffpath_1d",
-                fused_1d_result,
+                fused_1d_sum_result,
+                labels.sum(),
+            ),
+            result_row(
+                dataset,
+                loaded["save"],
+                "fused_sum_abs_reconstruction_diffpath_1d",
+                fused_1d_sum_result,
                 labels.sum(),
             ),
         ]
+        if recon_max_result is not None:
+            save_rows.extend(
+                [
+                    result_row(
+                        dataset,
+                        loaded["save"],
+                        "final_reconstruction_max_abs",
+                        recon_max_result,
+                        labels.sum(),
+                    ),
+                    result_row(
+                        dataset,
+                        loaded["save"],
+                        "fused_max_abs_reconstruction_diffpath_1d",
+                        fused_1d_max_result,
+                        labels.sum(),
+                    ),
+                ]
+            )
         if diffpath_6d_result is not None:
             save_rows.extend(
                 [
@@ -552,26 +767,101 @@ def evaluate_dataset(root, dataset, alphas, saves=None):
                         dataset,
                         loaded["save"],
                         "fused_reconstruction_diffpath_6d",
-                        fused_6d_result,
+                        fused_6d_sum_result,
+                        labels.sum(),
+                    ),
+                    result_row(
+                        dataset,
+                        loaded["save"],
+                        "fused_sum_abs_reconstruction_diffpath_6d",
+                        fused_6d_sum_result,
                         labels.sum(),
                     ),
                 ]
             )
+            if fused_6d_max_result is not None:
+                save_rows.append(
+                    result_row(
+                        dataset,
+                        loaded["save"],
+                        "fused_max_abs_reconstruction_diffpath_6d",
+                        fused_6d_max_result,
+                        labels.sum(),
+                    )
+                )
+        if diffpath_6d_gmm_result is not None:
+            save_rows.extend(
+                [
+                    result_row(
+                        dataset,
+                        loaded["save"],
+                        "diffpath_6d_gmm",
+                        diffpath_6d_gmm_result,
+                        labels.sum(),
+                    ),
+                    result_row(
+                        dataset,
+                        loaded["save"],
+                        "fused_reconstruction_diffpath_6d_gmm",
+                        fused_6d_gmm_sum_result,
+                        labels.sum(),
+                    ),
+                    result_row(
+                        dataset,
+                        loaded["save"],
+                        "fused_sum_abs_reconstruction_diffpath_6d_gmm",
+                        fused_6d_gmm_sum_result,
+                        labels.sum(),
+                    ),
+                ]
+            )
+            if fused_6d_gmm_max_result is not None:
+                save_rows.append(
+                    result_row(
+                        dataset,
+                        loaded["save"],
+                        "fused_max_abs_reconstruction_diffpath_6d_gmm",
+                        fused_6d_gmm_max_result,
+                        labels.sum(),
+                    )
+                )
         per_save_rows.extend(save_rows)
 
         message = (
             f"[DiffPath-F1] {dataset} {loaded['save']}: "
-            f"recon_f1={recon_result['f1']:.6f}, "
-            f"diffpath_1d_f1={diffpath_result['f1']:.6f}, "
-            f"fused_1d_f1={fused_1d_result['f1']:.6f}, "
-            f"alpha_1d={fused_1d_result['alpha']:.2f}"
+            f"recon_sum_raw_f1={recon_sum_result['f1']:.6f}, "
+            f"diffpath_1d_raw_f1={diffpath_result['f1']:.6f}, "
+            f"fused_sum_1d_f1={fused_1d_sum_result['f1']:.6f}, "
+            f"alpha_sum_1d={fused_1d_sum_result['alpha']:.2f}"
         )
+        if recon_max_result is not None:
+            message += (
+                f", recon_max_raw_f1={recon_max_result['f1']:.6f}, "
+                f"fused_max_1d_f1={fused_1d_max_result['f1']:.6f}, "
+                f"alpha_max_1d={fused_1d_max_result['alpha']:.2f}"
+            )
         if diffpath_6d_result is not None:
             message += (
-                f", diffpath_6d_f1={diffpath_6d_result['f1']:.6f}, "
-                f"fused_6d_f1={fused_6d_result['f1']:.6f}, "
-                f"alpha_6d={fused_6d_result['alpha']:.2f}"
+                f", diffpath_6d_raw_f1={diffpath_6d_result['f1']:.6f}, "
+                f"fused_sum_6d_f1={fused_6d_sum_result['f1']:.6f}, "
+                f"alpha_sum_6d={fused_6d_sum_result['alpha']:.2f}"
             )
+            if fused_6d_max_result is not None:
+                message += (
+                    f", fused_max_6d_f1={fused_6d_max_result['f1']:.6f}, "
+                    f"alpha_max_6d={fused_6d_max_result['alpha']:.2f}"
+                )
+        if diffpath_6d_gmm_result is not None:
+            message += (
+                f", diffpath_6d_gmm_raw_f1={diffpath_6d_gmm_result['f1']:.6f}, "
+                f"fused_sum_6d_gmm_f1={fused_6d_gmm_sum_result['f1']:.6f}, "
+                f"alpha_sum_6d_gmm={fused_6d_gmm_sum_result['alpha']:.2f}"
+            )
+            if fused_6d_gmm_max_result is not None:
+                message += (
+                    f", fused_max_6d_gmm_f1={fused_6d_gmm_max_result['f1']:.6f}, "
+                    f"alpha_max_6d_gmm={fused_6d_gmm_max_result['alpha']:.2f}"
+                )
         print(message)
     return per_save_rows + summary_rows(dataset, per_save_rows)
 

@@ -1,4 +1,5 @@
 import unittest
+import tempfile
 
 import numpy as np
 import torch
@@ -6,10 +7,12 @@ import torch.nn as nn
 
 from diffpath_1d import (
     apply_diffpath_6d_calibrator,
+    apply_diffpath_6d_gmm_calibrator,
     backproject_windows_to_time,
     backproject_feature_windows_to_time,
     empirical_cdf,
     fit_diffpath_6d_calibrator,
+    fit_diffpath_6d_gmm_calibrator,
     fit_diffpath_calibrator,
     seed_for_save,
 )
@@ -17,6 +20,7 @@ from main_model import CSDI_base
 from tools.evaluate_pathB_diffpath_f1 import (
     best_fusion,
     best_point_adjusted_threshold,
+    load_score_file,
     point_adjust,
     precision_recall_f1,
 )
@@ -231,6 +235,36 @@ class CalibrationAndWindowTests(unittest.TestCase):
         self.assertTrue(np.isfinite(path_cdf).all())
         self.assertTrue(np.all((path_cdf >= 0.0) & (path_cdf <= 1.0)))
 
+    def test_6d_gmm_calibrator_outputs_finite_scores(self):
+        rng = np.random.default_rng(123)
+        normal_recon = np.linspace(0.0, 1.0, 80)
+        first = rng.normal(loc=-1.0, scale=0.2, size=(40, 6))
+        second = rng.normal(loc=1.0, scale=0.3, size=(40, 6))
+        normal_6d = np.concatenate([first, second], axis=0)
+        calibrator = fit_diffpath_6d_gmm_calibrator(
+            normal_recon,
+            normal_6d,
+            timesteps=[0, 5, 10, 15, 20, 25, 30, 35, 40, 45],
+            n_components=[2, 4],
+            covariance_types=["diag", "full"],
+            seed=11,
+        )
+        raw_score, recon_cdf, path_cdf = apply_diffpath_6d_gmm_calibrator(
+            calibrator,
+            np.asarray([0.0, 0.5, 1.0]),
+            normal_6d[[0, 40, 79]],
+        )
+        self.assertIn(int(calibrator["gmm_n_components"]), [2, 4])
+        self.assertIn(
+            str(np.asarray(calibrator["gmm_covariance_type"]).item()),
+            ["diag", "full"],
+        )
+        self.assertEqual(list(calibrator["standard_scaler_mean"].shape), [6])
+        self.assertTrue(np.isfinite(raw_score).all())
+        self.assertTrue(np.isfinite(recon_cdf).all())
+        self.assertTrue(np.isfinite(path_cdf).all())
+        self.assertTrue(np.all((path_cdf >= 0.0) & (path_cdf <= 1.0)))
+
 
 class F1SearchTests(unittest.TestCase):
     def brute_force_best(self, labels, scores):
@@ -286,6 +320,62 @@ class F1SearchTests(unittest.TestCase):
         )
         np.testing.assert_allclose(alpha_zero["scores"], diffpath)
         np.testing.assert_allclose(alpha_one["scores"], recon)
+
+    def test_diffpath_f1_loader_separates_raw_and_cdf_scores(self):
+        with tempfile.NamedTemporaryFile(suffix=".npz") as f:
+            np.savez_compressed(
+                f.name,
+                labels_aligned=np.asarray([0, 1, 0]),
+                valid_indices=np.asarray([0, 1, 2]),
+                final_recon_score=np.asarray([10.0, 20.0, 30.0]),
+                final_recon_score_sum_abs=np.asarray(
+                    [10.0, 20.0, 30.0]
+                ),
+                final_recon_score_max_abs=np.asarray(
+                    [7.0, 8.0, 9.0]
+                ),
+                diffpath_1d_raw_score=np.asarray([1.0, 2.0, 3.0]),
+                diffpath_6d_gmm_raw_score=np.asarray([4.0, 5.0, 6.0]),
+                recon_cdf=np.asarray([0.1, 0.2, 0.3]),
+                recon_sum_abs_cdf=np.asarray([0.1, 0.2, 0.3]),
+                recon_max_abs_cdf=np.asarray([0.9, 0.8, 0.7]),
+                diffpath_1d_cdf=np.asarray([0.4, 0.5, 0.6]),
+                diffpath_6d_gmm_cdf=np.asarray([0.7, 0.8, 0.9]),
+            )
+            loaded = load_score_file(f.name)
+
+        np.testing.assert_allclose(
+            loaded["recon_raw"],
+            np.asarray([10.0, 20.0, 30.0]),
+        )
+        np.testing.assert_allclose(
+            loaded["recon_sum_raw"],
+            np.asarray([10.0, 20.0, 30.0]),
+        )
+        np.testing.assert_allclose(
+            loaded["recon_max_raw"],
+            np.asarray([7.0, 8.0, 9.0]),
+        )
+        np.testing.assert_allclose(
+            loaded["diffpath_6d_gmm_raw"],
+            np.asarray([4.0, 5.0, 6.0]),
+        )
+        np.testing.assert_allclose(
+            loaded["recon_cdf"],
+            np.asarray([0.1, 0.2, 0.3]),
+        )
+        np.testing.assert_allclose(
+            loaded["recon_sum_cdf"],
+            np.asarray([0.1, 0.2, 0.3]),
+        )
+        np.testing.assert_allclose(
+            loaded["recon_max_cdf"],
+            np.asarray([0.9, 0.8, 0.7]),
+        )
+        np.testing.assert_allclose(
+            loaded["diffpath_6d_gmm_cdf"],
+            np.asarray([0.7, 0.8, 0.9]),
+        )
 
 
 if __name__ == "__main__":

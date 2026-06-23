@@ -50,6 +50,8 @@ parser.add_argument("--pathB_proto_dataset", type=str, default="")
 parser.add_argument("--pathB_proto_recompute", action="store_true")
 parser.add_argument("--saves", nargs="+", default=None)
 parser.add_argument("--diffpath_num_steps", type=int, default=10)
+parser.add_argument("--reconstruction_batch_size", type=int, default=24)
+parser.add_argument("--diffpath_batch_size", type=int, default=128)
 parser.add_argument(
     "--diffpath_kde_bandwidths",
     type=str,
@@ -60,6 +62,17 @@ parser.add_argument(
     type=str,
     default="0.2,0.5,1.0,2.0,5.0",
 )
+parser.add_argument(
+    "--diffpath_6d_gmm_components",
+    type=str,
+    default="2,4,8,16",
+)
+parser.add_argument(
+    "--diffpath_6d_gmm_covariance_types",
+    type=str,
+    default="diag,full",
+)
+parser.add_argument("--diffpath_disable_6d_kde", action="store_true")
 parser.add_argument("--diffpath_recompute_calibrator", action="store_true")
 args = parser.parse_args()
 result_tag = args.result_tag or args.dataset
@@ -132,14 +145,37 @@ for iteration in sorted(os.listdir("train_result")):
         train_data_path = train_data_path_list[0]
         test_data_path = test_data_path_list[0]
         label_data_path = label_data_path_list[0]
+        eval_batch_size = (
+            args.diffpath_batch_size
+            if args.pathB_mode == "diffpath"
+            else args.reconstruction_batch_size
+        )
         train_loader, valid_loader, train_error_loader_list, test_loader_list = get_dataloader(
             train_data_path,
             test_data_path,
             label_data_path,
-            batch_size=24,
+            batch_size=eval_batch_size,
             window_split=2,
             split=split
         )
+        recon_train_error_loader_list = train_error_loader_list
+        if (
+            args.pathB_mode == "diffpath"
+            and args.reconstruction_batch_size != eval_batch_size
+        ):
+            (
+                _recon_train_loader,
+                _recon_valid_loader,
+                recon_train_error_loader_list,
+                _recon_test_loader_list,
+            ) = get_dataloader(
+                train_data_path,
+                test_data_path,
+                label_data_path,
+                batch_size=args.reconstruction_batch_size,
+                window_split=2,
+                split=split,
+            )
         pathB_proto_loader = None
         if args.pathB_mode in ("proto", "both"):
             proto_train_data_path = f"data/Machine/{pathB_proto_dataset}_train.pkl"
@@ -234,7 +270,12 @@ for iteration in sorted(os.listdir("train_result")):
                         )
                     normal_loader = build_normal_loader(
                         normal_train_path,
-                        batch_size=24,
+                        batch_size=args.diffpath_batch_size,
+                        split=split,
+                    )
+                    recon_normal_loader = build_normal_loader(
+                        normal_train_path,
+                        batch_size=args.reconstruction_batch_size,
                         split=split,
                     )
                     run_diffpath_pathb(
@@ -251,10 +292,17 @@ for iteration in sorted(os.listdir("train_result")):
                         seed=diffpath_seed,
                         bandwidths=args.diffpath_kde_bandwidths,
                         bandwidths_6d=args.diffpath_6d_kde_bandwidths,
+                        gmm_components_6d=args.diffpath_6d_gmm_components,
+                        gmm_covariance_types_6d=(
+                            args.diffpath_6d_gmm_covariance_types
+                        ),
+                        enable_6d_kde=not args.diffpath_disable_6d_kde,
                         recompute_calibrator=(
                             args.diffpath_recompute_calibrator
                         ),
                         overwrite=args.overwrite,
+                        recon_normal_loader=recon_normal_loader,
+                        recon_test_loader=recon_train_error_loader_list,
                     )
                     continue
 
